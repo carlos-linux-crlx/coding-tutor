@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+launcher=$(readlink -f -- "$0")
+appdir=$(CDPATH='' cd -- "$(dirname -- "$launcher")" && pwd)
+if ! /usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Gtk, Adw; assert (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 5)' >/dev/null 2>&1; then
+    message="Rust Tutor needs Python GObject, GTK 4, and libadwaita 1.5 or later. On Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="Rust Tutor" --text="$message" || true
+    fi
+    printf '%s\n' "$message" >&2
+    exit 1
+fi
+exec /usr/bin/python3 "$appdir/usr/share/rust-tutor/main.py" "$@"
