@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rust Tutor
+Comment=Learn Rust through explanations, practice, and projects
+Exec=rust-tutor
+Icon=accessories-text-editor
+Terminal=false
+Categories=Education;ComputerScience;
+Keywords=Rust;Programming;Learning;
