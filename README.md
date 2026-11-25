@@ -46,16 +46,27 @@ Open **Project paths**, enter an idea, and choose the first job your project sho
 
 **Use this path** saves the approved proposal locally and makes it the active path after the Rust foundations. You can mark project pages complete, switch to another saved path, or return to the standard course. Completed core lessons and saved project paths keep their progress.
 
-## AppImage staging
+## Build and run the AppImage
 
-The packaging recipe stages a runnable AppDir using the Ubuntu packages listed above and a stock icon from the installed Ubuntu theme. From the project checkout, run these commands to stage and launch it.
+The AppImage uses the host Ubuntu Python, GTK, and libadwaita packages listed above. For an x86-64 build, save the official `appimagetool-x86_64.AppImage` and `runtime-x86_64` release assets in `build/tooling/`. Compare their SHA-256 values with the release asset digests before running the tool. [appimagetool releases](https://github.com/AppImage/appimagetool/releases) · [Type 2 runtime releases](https://github.com/AppImage/type2-runtime/releases)
 
 ```sh
-./packaging/build-appimage.sh --appdir-only
-./build/RustTutor.AppDir/AppRun
+chmod +x build/tooling/appimagetool-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 \
+  APPIMAGETOOL="$PWD/build/tooling/appimagetool-x86_64.AppImage" \
+  APPIMAGETOOL_RUNTIME_FILE="$PWD/build/tooling/runtime-x86_64" \
+  ./packaging/build-appimage.sh
 ```
 
-The current build stops at the AppDir because `appimagetool` is unavailable. Producing a distributable `.AppImage` requires `appimagetool` on PATH and a separate run of `./packaging/build-appimage.sh`. The recipe writes `build/RustTutor-<architecture>.AppImage`. [AppImage packaging tool](https://github.com/AppImage/appimagetool)
+Run the resulting `build/RustTutor-x86_64.AppImage` directly on a desktop with FUSE available. Use extract-and-run mode on systems without FUSE. [AppImage FUSE guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
+
+```sh
+APPIMAGE_EXTRACT_AND_RUN=1 ./build/RustTutor-x86_64.AppImage
+```
+
+The x86-64 build was verified with appimagetool `11d54c9` and the Type 2 runtime `fedfad5`. SquashFS inspection found the packaged launcher and desktop entry, and an extract-and-run launch opened the GTK window. The output and downloaded tools stay in Git-ignored `build/`.
+
+To work with the staged directory separately, run `./packaging/build-appimage.sh --appdir-only` and launch `./build/RustTutor.AppDir/AppRun`.
 
 AppImage is a distribution format. Learner code remains inside the limited interpreter. Automatic compilation of unrestricted exercise code requires a separately validated isolation mechanism.
 

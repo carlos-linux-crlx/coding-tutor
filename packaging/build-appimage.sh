@@ -28,9 +28,10 @@ if [ "${1:-}" = "--appdir-only" ]; then
     printf '%s\n' "$appdir"
     exit 0
 fi
-if ! command -v appimagetool >/dev/null 2>&1; then
-    printf '%s\n' 'AppDir is staged. Install appimagetool to produce the AppImage.' >&2
+tool=${APPIMAGETOOL:-appimagetool}
+if ! command -v "$tool" >/dev/null 2>&1; then
+    printf '%s\n' 'AppDir is staged. Set APPIMAGETOOL to a downloaded executable or put appimagetool on PATH.' >&2
     exit 1
 fi
 architecture=$(uname -m)
-ARCH="$architecture" appimagetool "$appdir" "$project/build/RustTutor-$architecture.AppImage"
+ARCH="$architecture" "$tool" "$appdir" "$project/build/RustTutor-$architecture.AppImage"
