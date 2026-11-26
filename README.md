@@ -41,6 +41,8 @@ Open **Rust reference** to browse, search, and save a printable HTML copy. Every
 
 The built-in tutor uses the downloaded model offline. Questions and feedback are kept in the tutor page for follow-up during that visit. Exercise checks determine whether the code passes. AI feedback is advisory.
 
+Tutor weights and the Piper voice download from Hugging Face and its CDNs. If your network filters downloads, allow access to the publisher and its CDN hosts, then retry in **Model setup**. Any runtime files already verified and saved are reused. [Hugging Face download hosts](https://huggingface.co/docs/hub/models-downloading#downloading-behind-a-proxy-or-firewall)
+
 The **Use LM Studio on this computer or on your LAN** panel is an optional alternative for models you already manage. On the same computer, start LM Studio’s loopback server, check the connection, and choose an installed GGUF instruction model. The app asks LM Studio to unload models it loads. LM Studio manages the server and any models it had already loaded. [LM Studio server setup](https://lmstudio.ai/docs/developer/rest/quickstart)
 
 ### Use another computer on your home network
