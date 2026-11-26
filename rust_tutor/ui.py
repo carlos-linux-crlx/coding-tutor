@@ -413,8 +413,9 @@ class TutorWindow(Adw.ApplicationWindow):
         article.append(label(lesson.title, "title-1"))
         article.append(label(lesson.question, "title-3"))
         article.append(label(lesson.explanation, "learning-body"))
+        walkthrough_text = "".join(f"{name}. {description} " for name, description in lesson.walkthrough)
         article.append(self.speech_controls(f"{lesson.title}. {lesson.question} {lesson.explanation} "
-                                            f"{lesson.example_description} {lesson.exercise}"))
+                                            f"{lesson.example_description} {walkthrough_text}{lesson.exercise}"))
         steps = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=8, row_spacing=8)
         steps.set_max_children_per_line(3)
         for step in lesson.flow:
@@ -424,6 +425,11 @@ class TutorWindow(Adw.ApplicationWindow):
         example, _ = code_view(lesson.example)
         article.append(example)
         article.append(label(lesson.example_description, "dim-label"))
+        if lesson.walkthrough:
+            article.append(label("Walk through the example", "title-3"))
+            for name, description in lesson.walkthrough:
+                article.append(label(name, "heading"))
+                article.append(label(description, "learning-body"))
         article.append(button("Open related reference", lambda: self.open_reference(lesson.reference), "flat"))
 
         article.append(Gtk.Separator())
@@ -454,9 +460,11 @@ class TutorWindow(Adw.ApplicationWindow):
         feedback = label()
         tutor_body.append(feedback)
         checked_source = None
-        solution_button = button("View worked solution…", lambda: self.confirm_solution(lesson, tutor_body))
-        solution_button.set_visible(False)
-        tutor_body.append(solution_button)
+        solution_button = None
+        if lesson.solution is not None:
+            solution_button = button("View worked solution…", lambda: self.confirm_solution(lesson, tutor_body))
+            solution_button.set_visible(False)
+            tutor_body.append(solution_button)
 
         def ask_about_draft():
             source = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
@@ -478,12 +486,15 @@ class TutorWindow(Adw.ApplicationWindow):
                 attempts = record.get("attempts", 0)
                 index = min(max(attempts - 1, 0), len(lesson.hints) - 1)
                 if passed:
-                    message = ("Your implementation met the exercise checks. For a follow-up, pick an input "
-                               "and explain how each statement or branch leads to its result.")
+                    message = lesson.success_tip or (
+                        "Your implementation met the exercise checks. For a follow-up, pick an input "
+                        "and explain how each statement or branch leads to its result."
+                    )
                 else:
                     message = f"Hint {index + 1} of {len(lesson.hints)}\n{lesson.hints[index]}"
                 feedback.set_text(message)
-                solution_button.set_visible(not passed and attempts >= len(lesson.hints))
+                if solution_button is not None:
+                    solution_button.set_visible(not passed and attempts >= len(lesson.hints))
                 tutor.set_reveal_child(True)
             else:
                 tutor.set_reveal_child(False)
@@ -507,13 +518,13 @@ class TutorWindow(Adw.ApplicationWindow):
         sample = action == "run"
         try:
             results = check(lesson, source, sample=sample)
-            passed = all(expected.expected == actual for expected, actual in results)
+            passed = all(case.matches(actual) for case, actual in results)
             rows = []
             for case, actual in results:
                 arguments = " ".join(case.arguments) or "Program output"
                 if sample:
                     rows.append(f"{arguments}\n{actual or '(no output)'}")
-                elif actual == case.expected:
+                elif case.matches(actual):
                     rows.append(f"Pass · {arguments}\n{actual or '(no output)'}")
                 else:
                     rows.append(f"Try again · {arguments}\nExpected: {case.expected}\nGot: {actual or '(no output)'}")

@@ -1,15 +1,28 @@
 """The first Rust milestone and its companion reference."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
 BOOK = "https://doc.rust-lang.org/book/"
 CARGO = "https://doc.rust-lang.org/cargo/"
+HELLO_WORLD = "Hello, world!"
+HELLO_WORLD_PROGRAM = f'fn main() {{\n    println!("{HELLO_WORLD}");\n}}'
+
+
+def is_custom_greeting(output: str) -> bool:
+    message = output.strip()
+    return bool(message) and message != HELLO_WORLD and output.splitlines() == [output]
+
 
 @dataclass(frozen=True)
 class Case:
     arguments: tuple[str, ...]
     expected: str
+    accepts: Callable[[str], bool] | None = None
+
+    def matches(self, output: str) -> bool:
+        return self.accepts(output) if self.accepts is not None else output == self.expected
 
 
 @dataclass(frozen=True)
@@ -25,9 +38,11 @@ class Lesson:
     cases: tuple[Case, ...]
     reference: str
     hints: tuple[str, ...]
-    solution: str
-    solution_explanation: str
+    solution: str | None
+    solution_explanation: str | None
     flow: tuple[str, str, str]
+    walkthrough: tuple[tuple[str, str], ...] = ()
+    success_tip: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,24 +58,34 @@ class Chapter:
 LESSONS = (
     Lesson(
         "first-program", "Your first Rust program",
-        "What happens between writing Rust and seeing a line of output?",
-        "A Rust file is source code. The compiler checks it and turns it into an executable. "
-        "When you run the executable, Rust enters the function called main. Its instructions execute in order. "
-        "Here, println! writes a line to standard output. The exclamation mark identifies it as a macro. "
-        "Type the example or change one string and predict what will appear before you run it.",
-        'fn main() {\n    println!("The program is running.");\n}',
-        "The quoted text is data. The program prints that text without the surrounding quotes.",
-        "Make the program print two lines in this order: Hello, Rust! and I wrote my first program. "
-        "Use Run to see the output, then Check to compare it with the exercise requirements.",
-        'fn main() {\n    println!("Hello!");\n}\n',
-        (Case((), "Hello, Rust!\nI wrote my first program."),),
+        "How does a Rust program print a message?",
+        "Read this complete Rust program before you edit anything. It has one function and prints one line.",
+        HELLO_WORLD_PROGRAM,
+        "This program prints Hello, world! on its own line.",
+        "Change the message between the double quotes to a short phrase of your choice. Keep the program printing "
+        "one nonempty line. Predict what it will show, choose Run sample to see the result, then choose Check exercise.",
+        HELLO_WORLD_PROGRAM + "\n",
+        (Case((), "One nonempty line with a message different from the example.", is_custom_greeting),),
         "execution",
-        ("Find the function named main. That is where your two instructions go.",
-         "Give println! the exact text for each line, including punctuation.",
-         "Add a second println! call under the first. Read the instructions from top to bottom."),
-        'fn main() {\n    println!("Hello, Rust!");\n    println!("I wrote my first program.");\n}',
-        "Each call writes one line. main executes the first call before the second, so the terminal shows the lines in order.",
-        ("Edit the source", "Compile the program", "Read the output"),
+        ("Which part of the example appears on the screen? Look for the place where that text is written.",
+         "Change only the text inside the double quotes. Keep both quotes and the rest of the line in place.",
+         "Use Run sample to compare the line on screen with your prediction. Check that your message is different "
+         "from the example and stays on one line."),
+        None, None,
+        ("Compile the source", "Run the program", "Read the output"),
+        walkthrough=(
+            ("Start with fn main()", "fn declares a function, a named group of instructions. main is the program’s "
+             "entry point. When you run the program, Rust starts there. The empty parentheses mean main takes no inputs."),
+            ("Read the body", "The opening and closing braces mark the body of main. The indented line between them is "
+             "the instruction that runs. The semicolon ends that instruction."),
+            ("Call the println! macro", "println! prints a line of text. The exclamation mark after println tells Rust "
+             "you are calling a macro. While compiling, Rust expands the macro into the code that writes the line."),
+            ("Find the string literal", "The double quotes surround a string literal, which is text written directly "
+             "in the program. The output contains the text inside the quotes, including the exclamation mark in the message."),
+            ("Compile, then run", "The compiler checks the source code and turns it into an executable. Running that "
+             "executable starts main, and the instruction inside main writes the message to the terminal."),
+        ),
+        success_tip="Your program printed the message you chose. Point to the part of your code that determined the output.",
     ),
     Lesson(
         "functions", "Values and functions",
