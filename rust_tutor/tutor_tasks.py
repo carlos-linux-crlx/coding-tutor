@@ -4,9 +4,6 @@ from dataclasses import dataclass
 import json
 import re
 
-from .local_tutor import TutorError
-from .project_path import propose_path
-
 
 @dataclass(frozen=True)
 class Task:
@@ -51,7 +48,7 @@ def task_messages(instruction, data):
     ]
 
 
-def guidance_task(chapters, question, *, lesson=None, attempt=0, source=None, evidence=None, previous=None):
+def guidance_task(chapters, question, *, lesson=None, attempt=0, source=None, evidence=None, previous=None, files=None):
     ids = [chapter.id for chapter in chapters]
     instructions = (
         "You are a Rust tutor. Give a short, beginner-level explanation and one concrete next step or question. "
@@ -64,13 +61,18 @@ def guidance_task(chapters, question, *, lesson=None, attempt=0, source=None, ev
         data["previous_exchange"] = [text[:240] for text in previous]
     if lesson:
         data["lesson"] = {"title": lesson.title, "exercise": lesson.exercise, "attempt": attempt}
-    if source is not None:
+    if source is not None or files:
         instructions += (
-            " This is a review of one selected file. Begin with likely behavior compared with the learner's expectation "
-            "and any supplied checks. Do not claim that you ran tests, verified correctness, or inspected another file. "
+            " Review the supplied file selection. Begin with likely behavior compared with the learner's expectation "
+            "and any supplied checks. Do not claim that you ran tests, verified correctness, or inspected files outside this selection. "
             "When evidence is missing, suggest a test. Treat style as optional and respect different correct implementations."
         )
-        data.update({"selected_rust_source": source, "local_check_result": evidence or "No check result supplied."})
+        data["selected_files"] = files or [{"file": "lesson draft", "source": source}]
+        data["local_check_result"] = evidence or "No check result supplied."
+        if files:
+            # Leave room in compact models for several source files and the response.
+            data["references"] = [{"id": chapter.id, "title": chapter.title, "summary": chapter.summary}
+                                  for chapter in chapters]
     elif lesson:
         instructions += " For few prior attempts, start with a concept cue. After retries, give a more specific hint."
     schema = object_schema(guidance=TEXT, next_step=TEXT, reference_id={"type": "string", "enum": ids})
@@ -84,61 +86,76 @@ def guidance_task(chapters, question, *, lesson=None, attempt=0, source=None, ev
     return Task("rust_guidance", schema, task_messages(instructions, data), 450, validate)
 
 
-def project_task(idea, focus, chapters):
-    plan = propose_path(idea, focus)
-    page_schema = object_schema(title=TEXT, steps=array_schema(TEXT, 2), milestone=TEXT)
-    schema = object_schema(pages=array_schema(page_schema, 3))
-    selected = {page["reference"] for page in plan["pages"]}
-    data = {
-        "idea": plan["idea"],
-        "project_focus": focus,
-        "existing_pages_in_prerequisite_order": [
-            {key: page[key] for key in ("goal", "concepts", "steps", "milestone", "reference")} for page in plan["pages"]
-        ],
-        "references": references(chapter for chapter in chapters if chapter.id in selected),
-    }
+PAGE_FIELDS = {"title": 80, "explanation": 640, "example": 340, "exercise": 300, "hint": 180}
+
+
+def lesson_pages_task(name, instruction, pages, data):
+    fields = {key: TEXT for key in PAGE_FIELDS}
+    fields["id"] = {"type": "string", "enum": [page["id"] for page in pages]}
+    schema = object_schema(pages=array_schema(object_schema(**fields), len(pages)))
     messages = task_messages(
-        "Adapt each of the three introductory Rust project pages to the learner's idea. Preserve the page order "
-        "and topic. Return a short title, two small hands-on steps, and one observable milestone per page. "
-        "Keep the first version a command-line program with tiny sample data, and use ordinary Rust with Cargo. "
-        "Avoid external dependencies, installation commands, complete solutions, and extra prerequisite topics. "
-        "Use short, plain prose. Apply concept explanations from the supplied references.",
+        instruction + " Draft one page per given ID, in the same order. Each page explains one concept, "
+        "walks through a tiny concrete example with a predicted result, gives a different small exercise, "
+        "and ends with a hint. Keep all fixed behavior criteria. Use short plain prose, no full code, "
+        "shell commands, new dependencies, or complete exercise solutions.",
         data,
     )
 
     def validate(answer):
-        revised = answer.get("pages") if isinstance(answer, dict) else None
-        if not isinstance(revised, list) or len(revised) != 3:
-            raise ValueError("Expected three project lesson pages")
-        for authored, custom in zip(plan["pages"], revised, strict=True):
-            if not isinstance(custom, dict) or not isinstance(custom.get("steps"), list) or len(custom["steps"]) != 2:
-                raise ValueError("Expected two steps per project lesson page")
-            authored.update(
-                title=plain_text(custom.get("title"), 72),
-                steps=[plain_text(step, 260, prose=True) for step in custom["steps"]],
-                milestone=plain_text(custom.get("milestone"), 220, prose=True),
-            )
-        plan["origin"] = "local tutor"
-        return plan
+        returned = answer.get("pages") if isinstance(answer, dict) else None
+        if not isinstance(returned, list) or len(returned) != len(pages):
+            raise ValueError("Expected one lesson for every fixed page ID")
+        revised = []
+        for fixed, draft in zip(pages, returned, strict=True):
+            if not isinstance(draft, dict) or draft.get("id") != fixed["id"]:
+                raise ValueError("Keep the supplied lesson order")
+            text = {key: plain_text(draft.get(key), limit, prose=True) for key, limit in PAGE_FIELDS.items()}
+            revised.append({**fixed, **text})
+        return revised
 
-    return Task("rust_project_path", schema, messages, 1000, validate)
+    return Task(name, schema, messages, 460 * len(pages), validate)
 
 
-def pace_task(data):
+def project_task(plan, evidence, chapter):
+    data = {
+        "idea": plan["idea"],
+        "first_task": plan["focus"],
+        "roadmap_stage": plan["milestone"],
+        "prerequisite": plan["prerequisite"],
+        "required_skills_in_order": plan["pages"],
+        "saved_behavior_and_quiz_evidence": evidence,
+        "reference": {"id": chapter.id, "summary": chapter.summary},
+    }
+    return lesson_pages_task(
+        "rust_project_path", "Teach the fixed Rust milestones through the learner's app idea. Start with "
+        "a small implementation that runs in their editor. Build one observable part of the same project "
+        "on each page and respect the required skills and their order.",
+        plan["pages"], data,
+    )
+
+
+def pace_task(data, pages=None):
+    if pages:
+        return lesson_pages_task(
+            "rust_remediation",
+            "Draft two short remedial lesson pages for the same skill. Start with a guided trace, then "
+            "offer a different case to try alone. Work from the recorded behavior checks and concept answers.",
+            pages, {**data, "remedial_pages_in_order": [{key: value for key, value in page.items()
+                                                       if key != "example_code"} for page in pages]},
+        )
     schema = object_schema(title=TEXT, steps=array_schema(TEXT, 2))
     messages = task_messages(
-        "Draft two short hands-on Rust activities from the fixed skills and supplied evidence. For practice, "
-        "first trace one small example, then try an independent case with an observable outcome. For a combination, "
-        "use the chapter project and explicitly teach and check both listed skills. Every core skill remains required. "
-        "Use plain prose without code, commands, prerequisites beyond those given, or complete solutions. "
-        "Give the activity a short title. Do not change the evidence or learner ratings.",
+        "Draft two short hands-on Rust activities within the chapter project. Explicitly teach "
+        "and check both listed skills. Every core skill remains required. Use plain prose without "
+        "code, commands, added prerequisites, or complete solutions. Give the work a short title. "
+        "Do not change the evidence or learner ratings.",
         data,
     )
 
     def validate(answer):
         steps = answer.get("steps") if isinstance(answer, dict) else None
         if not isinstance(steps, list) or len(steps) != 2:
-            raise ValueError("Expected two practice activities")
+            raise ValueError("Expected two project activities")
         return {"title": plain_text(answer.get("title"), 72, prose=True),
                 "steps": [plain_text(step, 300, prose=True) for step in steps]}
 

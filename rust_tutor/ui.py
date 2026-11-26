@@ -15,16 +15,24 @@ from gi.repository import Adw, Gio, GLib, Gtk
 from .course import COURSES
 from .exercises import ExerciseError, check
 from .hardware import assessment, memory, piper_command, valid_voice
-from .learning import milestone_ready, pacing_options, questions, quiz_results, quiz_score, skill_progress
-from .local_tutor import CONTEXTS, DEFAULT_PORT, REVIEW_LIMIT, Request, Settings, TutorError, cli_available, generate, list_models
+from .learning import (
+    concept_evidence, milestone_ready, pacing_options, questions, quiz_results, quiz_score,
+    skill_progress, upcoming_project_topics,
+)
+from .local_tutor import CONTEXTS, DEFAULT_PORT, LOOPBACK, REVIEW_LIMIT, Request, Settings, TutorError, generate, list_models
 from .managed_runtime import generate_managed
 from .model_catalog import LLAMA_RELEASE, PIPER_RELEASE, SPEECH, TUTORS
 from .model_manager import install, model_directory, need_resources, ready, remaining
-from .project_path import FOCUSES, propose_path
+from .project_path import FOCUSES, propose_path, propose_roadmap_path, remedial_pages
 from .reference import print_sheet, printable_reference, printable_sheet
+from .review import MAX_FILES, read_selection, review_payload
 from .speech import Narrator
 from .state import Progress
-from .tutor_tasks import guidance_task, pace_task, project_task, report_task
+from .tutor_tasks import PAGE_FIELDS, guidance_task, pace_task, project_task, report_task
+
+
+MANUAL_FIELDS = {"title": "Title", "explanation": "Concept", "example": "Worked example",
+                 "exercise": "Try it yourself", "hint": "Hint"}
 
 
 def column(spacing=12):
@@ -96,7 +104,7 @@ class TutorWindow(Adw.ApplicationWindow):
         self.progress = Progress()
         self.narrator = Narrator()
         self.tutor_job = None
-        self.tutor_token = ""
+        self.tutor_session = None
         self.page_revision = 0
         self.draft_timer = 0
         self.sidebar_rows = {}
@@ -251,13 +259,28 @@ class TutorWindow(Adw.ApplicationWindow):
         config = self.progress.data.get("tutor", {})
         if config.get("backend") == "managed":
             return any(preset.key == config.get("model") and ready(preset) for preset in TUTORS)
-        return bool(config.get("model"))
+        host, port = config.get("host", LOOPBACK), config.get("port")
+        needs_token = host != LOOPBACK or config.get("requires_token")
+        return bool(config.get("model") and (not needs_token or self.session_token(host, port)))
+
+    def session_token(self, host, port):
+        if self.tutor_session and self.tutor_session[:2] == (host, port):
+            return self.tutor_session[2]
+        return ""
+
+    def tutor_destination(self):
+        config = self.progress.data.get("tutor", {})
+        if config.get("backend") == "managed":
+            return "Rust Tutor on this computer"
+        host = config.get("host", LOOPBACK)
+        return "LM Studio on this computer" if host == LOOPBACK else f"LM Studio at {host}:{config['port']} over your LAN"
 
     def tutor_settings(self):
         config = self.progress.data.get("tutor", {})
         if not config.get("model"):
             raise TutorError("Tutor not configured. Check the LM Studio server and choose a model in Model setup.")
-        return Settings(config["port"], config["model"], config["context"], self.tutor_token)
+        host, port = config.get("host", LOOPBACK), config["port"]
+        return Settings(port, config["model"], config["context"], self.session_token(host, port), host)
 
     def start_tutor_job(self, work, receive, status, pending, cancel=None, settled=None):
         if self.tutor_job:
@@ -334,9 +357,9 @@ class TutorWindow(Adw.ApplicationWindow):
     def open_tutor(self, lesson=None, review=None):
         article = self.document("tutor", "Ask tutor")
         article.append(label("Ask the local Rust tutor", "title-1"))
-        explanation = ("Your question and the current lesson draft go to the local model when you ask."
-                       if review else "Ask about a Rust concept, an error, or a next step. Your question goes to the "
-                                      "model on this computer when you ask.")
+        destination = self.tutor_destination() if self.tutor_configured() else "the selected model once configured"
+        shared = "Your question and the current lesson draft" if review else "Your question"
+        explanation = f"Ask about a Rust concept, an error, or a next step. {shared} will be sent to {destination}."
         article.append(label(explanation))
         if lesson:
             article.append(label(lesson.title, "heading"))
@@ -447,6 +470,7 @@ class TutorWindow(Adw.ApplicationWindow):
             self.in_app_practice(article, lesson, record)
         article.append(button("Ask the local tutor", lambda: self.open_tutor(lesson), "flat"))
         stage = next(stage for stage in self.milestones.values() if lesson.id in stage.skill_ids)
+        self.insert_practice(article, stage, lesson.id, lambda: self.open_lesson(lesson))
         article.append(button("Chapter cheat sheet", lambda: self.open_cheat_sheet(
             stage.title, stage.cheat_sheet, lambda: self.open_lesson(lesson)), "flat"))
         if lesson.id == stage.skill_ids[-1]:
@@ -654,7 +678,7 @@ class TutorWindow(Adw.ApplicationWindow):
         article.append(search)
         article.append(button("Save printable copy…", self.export_reference, "flat"))
         if return_action is not None:
-            article.append(button("Return to project lesson", return_action, "flat"))
+            article.append(button("Return to lesson", return_action, "flat"))
         elif chapter_id in self.chapters:
             origin = self.progress.course(self.language).get("current")
             if origin in self.lessons:
@@ -785,8 +809,7 @@ class TutorWindow(Adw.ApplicationWindow):
     def open_milestone(self, stage):
         article = self.document("quiz", stage.title)
         course = self.progress.course(self.language)
-        adjustment = course.get("pacing", {}).get(stage.id, {})
-        plan = adjustment.get("saved", {}).get(adjustment.get("active"))
+        plan = self.active_pace(stage)
         article.append(label(stage.title, "title-1"))
         if stage.prerequisite:
             prior = self.milestones[stage.prerequisite]
@@ -811,11 +834,7 @@ class TutorWindow(Adw.ApplicationWindow):
             opened = bool(answered or any(skill.tried or skill.passed for skill in skills.values()))
             status_text = "Ready to move on" if ready else "Needs more practice" if opened else "Not yet covered"
             report.append(label(status_text, "title-2"))
-            passed = sum(skill.passed for skill in skills.values())
-            required = sum(skill.required for skill in skills.values())
-            graph = Gtk.ProgressBar(show_text=True, fraction=passed / required,
-                                    text=f"Behavior checks · {passed}/{required}")
-            report.append(graph)
+            report.append(label("Skills · behavior checks and concept answers", "heading"))
             report.append(label(f"Concept quiz · {correct * 100 // total}% ({correct}/{total} correct, "
                                 f"{answered}/{total} answered)" if answered else "Concept quiz · No answers recorded"))
             for key, skill in skills.items():
@@ -830,13 +849,19 @@ class TutorWindow(Adw.ApplicationWindow):
                 if plan and plan["kind"] == "combine" and key in plan["skills"]:
                     rating += f" · Combined into {plan['title']}"
                 report.append(label(f"{title} · {rating}"))
+                graph = Gtk.ProgressBar(show_text=True, fraction=skill.passed / skill.required,
+                                        text=f"Behavior {skill.passed}/{skill.required} · "
+                                             f"Concept {sum(answer is True for answer in answers)}/{len(answers)}")
+                graph.set_tooltip_text(f"{title}. {graph.get_text()}")
+                report.append(graph)
             hints = sum(skill.hints for skill in skills.values())
             retries = sum(skill.retries for skill in skills.values())
             report.append(label(f"Support used · {hints} hints · {retries} unsuccessful check attempts", "dim-label"))
             if stage.outline or any(self.lessons[key].editor_checks for key in stage.skill_ids):
                 report.append(label("Cargo checks are observations you record after running your own code.", "dim-label"))
-            report.append(label("You’ve demonstrated the required behavior. Carry it into the next project." if ready else
-                                "Try one small case at a time. Use the next unchecked behavior or the quiz to decide what to revisit."))
+            next_step = "Carry the demonstrated skills into the next project." if ready else (
+                "Revisit a skill marked for practice, then try one small behavior check or retake the quiz.")
+            report.append(label(f"Next step · {next_step}"))
 
         def ask_for_summary():
             evidence = quiz_results(course, stage)
@@ -871,6 +896,9 @@ class TutorWindow(Adw.ApplicationWindow):
         personalize = button("Ask tutor for a short chapter summary", ask_for_summary, "flat")
         personalize.set_sensitive(self.tutor_configured())
         article.append(personalize)
+        if self.tutor_configured():
+            article.append(label(f"The summary uses the chapter evidence shown above and goes to "
+                                 f"{self.tutor_destination()} when requested.", "dim-label"))
         article.append(cancel)
         article.append(status)
         article.append(report_note)
@@ -879,6 +907,7 @@ class TutorWindow(Adw.ApplicationWindow):
             for key in stage.skill_ids:
                 lesson = self.lessons[key]
                 article.append(button(lesson.title, lambda item=lesson: self.open_lesson(item), "flat"))
+                self.insert_practice(article, stage, key, lambda: self.open_milestone(stage))
         else:
             article.append(label("Core lesson outlines", "title-2"))
             article.append(label("Study each idea and try its two checks in a local Cargo project. "
@@ -903,9 +932,8 @@ class TutorWindow(Adw.ApplicationWindow):
                 record = self.progress.lesson(self.language, topic.id)
                 self.practice_observations(section, topic.checks, record, refresh)
                 (shared if topic.id in combined_skills else article).append(section)
-        if plan and plan["kind"] == "practice":
-            article.append(label(plan["title"], "title-2"))
-            self.pace_activities(article, plan)
+                self.insert_practice(article, stage, topic.id, lambda: self.open_milestone(stage))
+                self.insert_project_page(article, stage, topic.id)
         following = next((item for item in self.milestones.values() if item.prerequisite == stage.id), None)
         if following:
             article.append(button(f"Next milestone · {following.title}", lambda: self.open_milestone(following), "flat"))
@@ -972,7 +1000,10 @@ class TutorWindow(Adw.ApplicationWindow):
         if current:
             article.append(label(f"Active adjustment · {current['title']}", "title-2"))
             article.append(label(current["reason"]))
-            self.pace_activities(article, current)
+            if current.get("pages"):
+                self.practice_page_links(article, stage, current, lambda: self.open_pacing(stage))
+            else:
+                self.pace_activities(article, current)
 
             def restore():
                 adjustment["active"] = None
@@ -1006,32 +1037,17 @@ class TutorWindow(Adw.ApplicationWindow):
 
             def make_plan():
                 kind, keys = options[chooser.get_selected()]
-                names = [titles[key] for key in keys]
+                plan = {"kind": kind, "skills": list(keys), "done": [], "origin": "Authored lesson"}
                 if kind == "practice":
                     key = keys[0]
-                    lesson = self.lessons.get(key)
-                    if lesson and lesson.cases:
-                        cue = lesson.example_description
-                        inputs = ", ".join(lesson.cases[-1].arguments)
-                        exercise = (f"Predict the result for inputs {inputs}. Run the lesson checks and compare your prediction."
-                                    if inputs else "Try a different message, predict the output, then run the lesson checks.")
-                    elif lesson:
-                        cue = lesson.example_description
-                        exercise = f"Run a small check in your Cargo project. Look for this result: {lesson.editor_checks[-1]}"
-                    else:
-                        topic = self.topics[key]
-                        cue = topic.quick_reference
-                        exercise = f"Run the boundary case in your Cargo project. Look for this result: {topic.checks[-1]}"
-                    reason = "A concept answer or an observed check points to this skill for practice."
-                    steps = [f"Trace one example and explain the result. {cue}", exercise]
-                    title = f"Practice {names[0]}"
-                else:
-                    reason = "Both skills met their behavior checks and their concept and follow-up quiz criteria."
-                    title = "Shared project practice"
-                    steps = [f"Use this project: {stage.endpoint} Explain where each skill appears in your implementation.",
-                             "Run the normal and edge cases for each skill in the shared project. Record them separately."]
-                return {"kind": kind, "skills": list(keys), "title": title, "reason": reason, "steps": steps,
-                        "done": [], "origin": "Authored outline"}
+                    item = self.lessons.get(key) or self.topics[key]
+                    return {**plan, "title": f"Practice {titles[key]}",
+                            "reason": "A saved answer or behavior check points to this skill for practice.",
+                            "pages": remedial_pages(key, item, authored=key in self.lessons)}
+                return {**plan, "title": "Shared project practice",
+                        "reason": "Both skills met their behavior checks and their concept and follow-up quiz criteria.",
+                        "steps": [f"Use this project: {stage.endpoint} Explain where each skill appears in your implementation.",
+                                  "Run the normal and edge cases for each skill. Record the results separately."]}
 
             def clear(*_args):
                 while (child := result.get_first_child()) is not None:
@@ -1045,21 +1061,33 @@ class TutorWindow(Adw.ApplicationWindow):
                 result.append(label(plan["reason"]))
                 result.append(label(plan["origin"], "dim-label"))
                 fields = []
-                for name, value in zip(("Title", "First activity", "Second activity"),
-                                       (plan["title"], *plan["steps"]), strict=True):
-                    result.append(label(name, "heading"))
-                    entry = Gtk.Entry(text=value, max_length=400)
-                    entry.set_tooltip_text(name)
-                    result.append(entry)
-                    fields.append(entry)
+                page_editors = []
+                if plan.get("pages"):
+                    for page in plan["pages"]:
+                        page_editors.append(self.edit_manual_page(result, page))
+                else:
+                    for name, value in zip(("Title", "First activity", "Second activity"),
+                                           (plan["title"], *plan["steps"]), strict=True):
+                        result.append(label(name, "heading"))
+                        entry = Gtk.Entry(text=value, max_length=400)
+                        entry.set_tooltip_text(name)
+                        result.append(entry)
+                        fields.append(entry)
 
                 def apply():
-                    title, *steps = [field.get_text().strip() for field in fields]
-                    if not title or not all(steps):
-                        status.set_text("Enter a title and both activity descriptions.")
+                    try:
+                        if page_editors:
+                            approved = {**plan, "pages": self.edited_manual_pages(plan["pages"], page_editors)}
+                        else:
+                            title, *steps = [field.get_text().strip() for field in fields]
+                            if not title or not all(steps):
+                                raise ValueError("Enter a title and both activity descriptions.")
+                            approved = {**plan, "title": title, "steps": steps}
+                    except ValueError as error:
+                        status.set_text(str(error))
                         return
                     key = uuid4().hex
-                    adjustment["saved"][key] = {**plan, "title": title, "steps": steps}
+                    adjustment["saved"][key] = approved
                     adjustment["active"] = key
                     self.save()
                     self.open_pacing(stage)
@@ -1080,24 +1108,28 @@ class TutorWindow(Adw.ApplicationWindow):
                                   "concept_quiz": [concept.get(q.id) for q in questions(stage) if q.topic == key],
                                   "follow_up_quiz": follow_up.get(item.transfer.id) if key in self.topics else None})
                 data = {"kind": plan["kind"], "skills": items, "reason": plan["reason"], "project": stage.endpoint,
-                        "prerequisite": stage.prerequisite, "outline": plan["steps"]}
+                        "prerequisite": stage.prerequisite, "outline": plan.get("steps", [])}
 
                 def receive(response):
                     adapted, model_status = response
-                    preview({**plan, **adapted, "origin": "Local tutor proposal"})
+                    change = {"pages": adapted} if plan.get("pages") else adapted
+                    preview({**plan, **change, "origin": "Tutor proposal"})
                     status.set_text(model_status)
 
-                self.ask_model(lambda: pace_task(data), receive, status, cancel)
+                self.ask_model(lambda: pace_task(data, plan.get("pages")), receive, status, cancel)
 
             def selection_changed(*_args):
                 self.cancel_tutor()
                 clear()
 
             chooser.connect("notify::selected", selection_changed)
-            article.append(button("Preview suggested activities", lambda: preview(make_plan())))
-            tutor_button = button("Ask tutor to draft activities", ask)
+            article.append(button("Preview suggested pages or activities", lambda: preview(make_plan())))
+            tutor_button = button("Ask tutor to draft this adjustment", ask)
             tutor_button.set_sensitive(self.tutor_configured())
             article.append(tutor_button)
+            if self.tutor_configured():
+                article.append(label(f"The selected skill and saved check and quiz evidence go to "
+                                     f"{self.tutor_destination()} when you ask.", "dim-label"))
             article.append(cancel)
             article.append(status)
             article.append(result)
@@ -1108,10 +1140,107 @@ class TutorWindow(Adw.ApplicationWindow):
             entries = column(8)
             for old in reversed(archived):
                 entries.append(label(old["title"], "heading"))
-                entries.append(label(f"{len(old['done'])} of {len(old['steps'])} activities completed"))
+                entries.append(label(f"{len(old['done'])} of {len(old.get('pages') or old['steps'])} activities completed"))
             history.set_child(entries)
             article.append(history)
         article.append(button("Back to milestone", lambda: self.open_milestone(stage), "flat"))
+
+    def active_pace(self, stage):
+        adjustment = self.progress.course(self.language).get("pacing", {}).get(stage.id, {})
+        return adjustment.get("saved", {}).get(adjustment.get("active"))
+
+    def insert_practice(self, article, stage, key, back):
+        plan = self.active_pace(stage)
+        if not plan or plan["kind"] != "practice" or key not in plan["skills"]:
+            return
+        if plan.get("pages"):
+            self.practice_page_links(article, stage, plan, back)
+        else:
+            self.pace_activities(article, plan)
+
+    def practice_page_links(self, article, stage, plan, back):
+        for index, page in enumerate(plan["pages"]):
+            done = " · Complete" if index in plan["done"] else ""
+            article.append(button(f"Extra lesson · {page['title']}{done}",
+                                  lambda i=index: self.open_practice_page(stage, plan, i, back), "flat"))
+
+    def open_practice_page(self, stage, plan, index, back):
+        page = plan["pages"][index]
+        article = self.document("quiz", page["title"])
+        article.append(label(stage.title + " · Extra lesson", "dim-label"))
+        self.show_manual_page(article, page)
+        lesson = self.lessons.get(plan["skills"][0])
+        if lesson:
+            article.append(button("Open related reference", lambda: self.open_reference(
+                lesson.reference, lambda: self.open_practice_page(stage, plan, index, back)), "flat"))
+        else:
+            article.append(button("Open chapter cheat sheet", lambda: self.open_cheat_sheet(
+                stage.title, stage.cheat_sheet, lambda: self.open_practice_page(stage, plan, index, back)), "flat"))
+        complete = Gtk.CheckButton(label="Mark this extra lesson complete", active=index in plan["done"])
+
+        def mark(control):
+            if control.get_active():
+                plan["done"].append(index)
+            else:
+                plan["done"].remove(index)
+            self.save()
+
+        complete.connect("toggled", mark)
+        article.append(complete)
+        if index + 1 < len(plan["pages"]):
+            article.append(button("Next extra lesson", lambda: self.open_practice_page(stage, plan, index + 1, back),
+                                  "suggested-action"))
+        article.append(button("Return to course", back, "flat"))
+
+    def show_manual_page(self, article, page):
+        article.append(label(page["title"], "title-1"))
+        if page.get("skill_title"):
+            article.append(label(f"Core skill · {page['skill_title']}", "dim-label"))
+        article.append(self.speech_controls(" ".join(page[key] for key in ("title", "explanation", "example", "exercise"))))
+        for key in ("explanation", "example", "exercise"):
+            article.append(label(MANUAL_FIELDS[key], "title-3"))
+            article.append(label(page[key], "learning-body"))
+            if key == "example" and page.get("example_code"):
+                example, _ = code_view(page["example_code"])
+                article.append(example)
+        article.append(label("Check the behavior", "title-3"))
+        for criterion in page["checks"]:
+            article.append(label(criterion))
+        hint = Gtk.Expander(label="Show a hint")
+        hint.set_child(label(page["hint"]))
+        article.append(hint)
+
+    def edit_manual_page(self, article, page):
+        card = Gtk.Expander(label=page["title"], expanded=True)
+        content = column(6)
+        buffers = {}
+        if page.get("skill_title"):
+            content.append(label(f"Core skill · {page['skill_title']}", "heading"))
+        for key, field in MANUAL_FIELDS.items():
+            content.append(label(field, "heading"))
+            view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+            view.set_tooltip_text(field)
+            view.set_size_request(-1, 30 if key == "title" else 55)
+            view.get_buffer().set_text(page[key])
+            buffers[key] = view.get_buffer()
+            content.append(view)
+        for criterion in page["checks"]:
+            content.append(label(criterion, "dim-label"))
+        card.set_child(content)
+        article.append(card)
+        return buffers
+
+    def edited_manual_pages(self, pages, editors):
+        approved = []
+        for page, buffers in zip(pages, editors, strict=True):
+            updated = page.copy()
+            for key, buffer in buffers.items():
+                value = " ".join(buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True).split())
+                if not 0 < len(value) <= PAGE_FIELDS[key]:
+                    raise ValueError(f"Enter up to {PAGE_FIELDS[key]} characters for {MANUAL_FIELDS[key].lower()} on each page.")
+                updated[key] = value
+            approved.append(updated)
+        return approved
 
     def pace_activities(self, article, plan):
         for index, step in enumerate(plan["steps"]):
@@ -1166,21 +1295,54 @@ class TutorWindow(Adw.ApplicationWindow):
     def foundations_complete(self):
         return all(self.foundation_complete(key) for key in self.lessons)
 
+    def project_page_prerequisite(self, plan, index):
+        pages = plan["pages"]
+        if pages[index]["id"] in plan["completed"]:
+            return ""
+        if plan.get("schema") != 2:
+            return ("Finish the ten foundation exercises first."
+                    if not plan["completed"] and not self.foundations_complete() else "")
+        course = self.progress.course(self.language)
+        for stage in self.milestones.values():
+            if stage.id == plan["milestone"]:
+                break
+            if not milestone_ready(course, stage, self.lessons):
+                return f"Finish the checks and quiz for {stage.title} first."
+        if index and pages[index - 1]["id"] not in plan["completed"]:
+            return f"Complete the previous project page first."
+        return ""
+
     def add_project_lessons(self, container, plan_id, plan):
-        if not plan["completed"] and not self.foundations_complete():
-            container.append(label("Your saved project pages open after all ten foundation exercises are complete.",
-                                   "dim-label"))
+        for index, page in enumerate(plan["pages"]):
+            done = " · Complete" if page["id"] in plan["completed"] else ""
+            prerequisite = self.project_page_prerequisite(plan, index)
+            if prerequisite:
+                container.append(label(f"{page['title']} · {prerequisite}", "dim-label"))
+            else:
+                container.append(button(page["title"] + done,
+                                        lambda item=index: self.open_project_lesson(plan_id, item), "flat"))
+
+    def insert_project_page(self, container, stage, key):
+        projects = self.project_progress()
+        plan_id = projects.get("active")
+        plan = projects["saved"].get(plan_id, {})
+        if plan.get("milestone") != stage.id:
             return
         for index, page in enumerate(plan["pages"]):
-            complete = " · Complete" if page["id"] in plan["completed"] else ""
-            container.append(button(page["title"] + complete,
-                                    lambda item=index: self.open_project_lesson(plan_id, item), "flat"))
+            if page["skill"] == key:
+                prerequisite = self.project_page_prerequisite(plan, index)
+                if prerequisite:
+                    container.append(label(f"Project lesson · {page['title']} · {prerequisite}", "dim-label"))
+                else:
+                    container.append(button(f"Project lesson · {page['title']}",
+                                            lambda i=index: self.open_project_lesson(plan_id, i), "flat"))
 
     def open_project_paths(self):
         article = self.document("projects", "Project paths")
         article.append(label("Plan a project you want to build", "title-1"))
-        article.append(label("Plan now and work through the optional pages after the ten foundation exercises. "
-                             "Preview a three-lesson template, or ask the local tutor to adapt it to your idea."))
+        article.append(label("Preview an offline starter template, or ask the tutor to teach your next roadmap "
+                             "skills through your own app idea. Project pages follow the same prerequisites "
+                             "and have separate completion marks."))
         projects = self.project_progress()
         idea = Gtk.Entry(placeholder_text="Example: A weekly grocery planner", max_length=180)
         focus = Gtk.DropDown(model=Gtk.StringList.new(["Choose a first task", *FOCUSES.values()]))
@@ -1203,23 +1365,37 @@ class TutorWindow(Adw.ApplicationWindow):
             clear_proposal()
             status.set_text(note)
             proposal.append(label(plan["idea"], "title-2"))
-            origin = "Adapted by the local tutor" if plan.get("origin") == "local tutor" else "Authored template"
-            proposal.append(label(origin, "dim-label"))
-            for page in plan["pages"]:
-                section = column(6)
-                section.add_css_class("card")
-                section.add_css_class("lesson-card")
-                section.append(label(page["title"], "heading"))
-                section.append(label(page["goal"]))
-                section.append(label("Concepts · " + ", ".join(page["concepts"]), "dim-label"))
-                for step in page["steps"]:
-                    section.append(label(step))
-                section.append(label("Milestone · " + page["milestone"], "dim-label"))
-                proposal.append(section)
+            if plan.get("schema") == 2:
+                stage = self.milestones[plan["milestone"]]
+                route = "Optional extension" if plan.get("extension") else "Next roadmap chapter"
+                proposal.append(label(f"{route} · {stage.title}", "heading"))
+                prior = self.milestones[plan["prerequisite"]]
+                proposal.append(label(f"Prerequisite · {prior.title}", "dim-label"))
+                editors = [self.edit_manual_page(proposal, page) for page in plan["pages"]]
+            else:
+                editors = []
+                proposal.append(label("Authored offline template", "dim-label"))
+                for page in plan["pages"]:
+                    section = column(6)
+                    section.add_css_class("card")
+                    section.add_css_class("lesson-card")
+                    section.append(label(page["title"], "heading"))
+                    section.append(label(page["goal"]))
+                    section.append(label("Concepts · " + ", ".join(page["concepts"]), "dim-label"))
+                    for step in page["steps"]:
+                        section.append(label(step))
+                    section.append(label("Milestone · " + page["milestone"], "dim-label"))
+                    proposal.append(section)
 
             def apply_path():
+                try:
+                    approved = ({**plan, "pages": self.edited_manual_pages(plan["pages"], editors)}
+                                if editors else plan)
+                except ValueError as error:
+                    status.set_text(str(error))
+                    return
                 key = uuid4().hex
-                projects["saved"][key] = plan
+                projects["saved"][key] = approved
                 self.select_project_path(key)
 
             proposal.append(button("Use this path", apply_path, "suggested-action"))
@@ -1239,13 +1415,24 @@ class TutorWindow(Adw.ApplicationWindow):
 
         def adapt():
             clear_proposal()
+            course = self.progress.course(self.language)
+            stage, topics, extension = upcoming_project_topics(course, self.milestones.values(), self.lessons)
+            try:
+                draft = propose_roadmap_path(idea.get_text(), focus_key(), stage, topics, extension)
+            except ValueError as error:
+                status.set_text(str(error))
+                return
+            evidence = []
+            for topic in topics:
+                progress = skill_progress(course, topic.id, self.lessons)
+                evidence.append({"skill": topic.id, "behavior": f"{progress.passed}/{progress.required}",
+                                 "concept": concept_evidence(course, stage, topic.id)})
 
             def receive(response):
-                plan, model_status = response
-                render_plan(plan, f"Review the local tutor’s proposal before applying it. {model_status}")
+                pages, model_status = response
+                render_plan({**draft, "pages": pages}, f"Review and edit the tutor’s proposed pages. {model_status}")
 
-            self.ask_model(lambda: project_task(idea.get_text(), focus_key(), self.chapters.values()),
-                           receive, status, cancel)
+            self.ask_model(lambda: project_task(draft, evidence, self.chapters["resources"]), receive, status, cancel)
 
         def edit(*_args):
             self.cancel_tutor()
@@ -1257,8 +1444,9 @@ class TutorWindow(Adw.ApplicationWindow):
         build_ai = button("Build a project path with the tutor", adapt, "suggested-action")
         build_ai.set_sensitive(self.tutor_configured())
         article.append(build_ai)
-        article.append(label("The model receives the idea, first-task choice, and course reference material on this computer.",
-                             "dim-label"))
+        if self.tutor_configured():
+            article.append(label(f"The idea, planned skills, and relevant check and quiz evidence go to "
+                                 f"{self.tutor_destination()} when requested.", "dim-label"))
         if not self.tutor_configured():
             article.append(button("Configure the local tutor", self.open_models, "flat"))
         article.append(cancel)
@@ -1284,26 +1472,34 @@ class TutorWindow(Adw.ApplicationWindow):
 
     def open_project_lesson(self, plan_id, index):
         plan = self.project_progress()["saved"][plan_id]
-        if not plan["completed"] and not self.foundations_complete():
+        if self.project_page_prerequisite(plan, index):
             self.open_project_paths()
             return
         page = plan["pages"][index]
         article = self.document("projects", page["title"])
         article.append(label(plan["idea"], "dim-label"))
-        article.append(label(page["title"], "title-1"))
-        article.append(label(page["goal"], "title-3"))
-        article.append(label(page["explanation"], "learning-body"))
-        article.append(self.speech_controls(f"{page['title']}. {page['explanation']} " + " ".join(page["steps"])))
-        article.append(label("Example", "title-3"))
-        example, _ = code_view(page["example"])
-        article.append(example)
-        article.append(button("Open related reference", lambda: self.open_reference(
-            page["reference"], lambda: self.open_project_lesson(plan_id, index)), "flat"))
-        article.append(label("Try this in your editor", "title-3"))
-        for step in page["steps"]:
-            article.append(label(step, "learning-body"))
-        article.append(label("Project milestone", "title-3"))
-        article.append(label(page["milestone"]))
+        if plan.get("schema") == 2:
+            self.show_manual_page(article, page)
+            stage = self.milestones[plan["milestone"]]
+            article.append(button("Open chapter cheat sheet", lambda: self.open_cheat_sheet(
+                stage.title, stage.cheat_sheet, lambda: self.open_project_lesson(plan_id, index)), "flat"))
+            article.append(button("Open the core chapter and record its checks", lambda: self.open_milestone(
+                stage), "flat"))
+        else:
+            article.append(label(page["title"], "title-1"))
+            article.append(label(page["goal"], "title-3"))
+            article.append(label(page["explanation"], "learning-body"))
+            article.append(self.speech_controls(f"{page['title']}. {page['explanation']} " + " ".join(page["steps"])))
+            article.append(label("Example", "title-3"))
+            example, _ = code_view(page["example"])
+            article.append(example)
+            article.append(button("Open related reference", lambda: self.open_reference(
+                page["reference"], lambda: self.open_project_lesson(plan_id, index)), "flat"))
+            article.append(label("Try this in your editor", "title-3"))
+            for step in page["steps"]:
+                article.append(label(step, "learning-body"))
+            article.append(label("Project milestone", "title-3"))
+            article.append(label(page["milestone"]))
         complete = Gtk.CheckButton(label="Mark this page complete", active=page["id"] in plan["completed"])
 
         def update_progress(control):
@@ -1316,93 +1512,39 @@ class TutorWindow(Adw.ApplicationWindow):
         complete.connect("toggled", update_progress)
         article.append(complete)
         if index + 1 < len(plan["pages"]):
-            article.append(button("Next project lesson", lambda: self.open_project_lesson(plan_id, index + 1),
-                                  "suggested-action"))
+            next_page = button("Next project lesson", lambda: self.open_project_lesson(plan_id, index + 1),
+                               "suggested-action")
+            next_page.set_sensitive(not self.project_page_prerequisite(plan, index + 1))
+            complete.connect("toggled", lambda _control: next_page.set_sensitive(
+                not self.project_page_prerequisite(plan, index + 1)))
+            article.append(next_page)
         article.append(button("Return to project paths", self.open_project_paths, "flat"))
 
     def open_editor_review(self):
         article = self.document("handoff", "Review from editor")
-        article.append(label("Review code from your editor", "title-1"))
-        article.append(label("Save your file in VS Code or VSCodium, then choose it here. "
-                             "Rust Tutor reads the selected .rs file for this session. It leaves the project "
-                             "and lesson drafts alone and keeps the file on this computer."))
-        article.append(label("If the file follows a lesson's exercise signature, select that lesson and run "
-                             "its checks. For a full Cargo project, run cargo check and cargo test in your editor."))
-
-        preview, buffer = code_view("", editable=False)
-        preview.get_child().set_min_content_height(175)
-        preview.get_child().set_max_content_height(285)
-        preview.get_child().set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        file_status = label("No Rust file selected.", "dim-label")
-        output_title = label()
-        output = label()
+        revision = self.page_revision
+        article.append(label("Review code from VS Code or VSCodium", "title-1"))
+        article.append(label("Save your work in the editor, then choose up to four .rs files or a Cargo.toml. "
+                             "Choose just the related files. Rust Tutor previews the selection in memory without changing "
+                             "your project, walking folders, or launching your code."))
+        previews, buffer = code_view("")
+        scroller = previews.get_child()
+        scroller.set_min_content_height(175)
+        scroller.set_max_content_height(285)
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        file_status = label("No project files selected.", "dim-label")
+        display_choice = Gtk.DropDown()
+        display_choice.set_tooltip_text("Preview a selected file")
+        output_title, output = label(), label()
         output.set_selectable(True)
-        source = None
-        behavior = Gtk.Entry(placeholder_text="Optional: What should this code do?", max_length=400)
-        review_status = label()
-        answer = column()
+        behavior = Gtk.Entry(placeholder_text="What should this code do?", max_length=400)
+        review_status, answer = label(), column()
         cancel = self.cancel_control(review_status)
+        files = ()
+        evidence = None
         entries = tuple(lesson for lesson in self.lessons.values() if not lesson.editor_checks)
-        exercise_choice = Gtk.DropDown(model=Gtk.StringList.new(["Select a lesson"] + [entry.title for entry in entries]))
-        exercise_choice.set_tooltip_text("Choose which exercise requirements the selected file should meet")
-
-        def choose_file():
-            dialog = Gtk.FileDialog(title="Choose a saved Rust source file")
-            rust_filter = Gtk.FileFilter(name="Rust source files")
-            rust_filter.add_pattern("*.rs")
-            filters = Gio.ListStore.new(Gtk.FileFilter)
-            filters.append(rust_filter)
-            dialog.set_filters(filters)
-
-            def opened(chooser, result):
-                nonlocal source
-                try:
-                    selected = chooser.open_finish(result)
-                except GLib.Error as error:
-                    if not error.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
-                        file_status.set_text(error.message)
-                    return
-                clear_review()
-                output_title.set_text("")
-                output.set_text("")
-                try:
-                    if not selected or not selected.get_path():
-                        raise ValueError("Choose a local Rust source file.")
-                    path = Path(selected.get_path())
-                    if path.suffix != ".rs" or not path.is_file():
-                        raise ValueError("Choose a regular .rs source file.")
-                    with path.open("rb") as stream:
-                        contents = stream.read(48 * 1024 + 1)
-                    if len(contents) > 48 * 1024:
-                        raise ValueError("Choose a source file under 48 KiB.")
-                    candidate = contents.decode("utf-8")
-                    if "\x00" in candidate:
-                        raise ValueError("Choose a text source file.")
-                except (OSError, ValueError) as error:
-                    source = None
-                    buffer.set_text("")
-                    check_button.set_sensitive(False)
-                    file_status.set_text(f"Could not open the file. {error}")
-                    return
-                source = candidate
-                buffer.set_text(source)
-                file_status.set_text(f"Selected {path.name} · {len(contents):,} bytes · read-only")
-                output_title.set_text("")
-                output.set_text("")
-                check_button.set_sensitive(exercise_choice.get_selected() != 0)
-
-            dialog.open(self, None, opened)
-
-        def check_file():
-            index = exercise_choice.get_selected()
-            if source is None or index == 0:
-                return
-            lesson = entries[index - 1]
-            record = self.progress.lesson(self.language, lesson.id)
-            self.run_exercise(lesson, source, record, "review", output_title, output)
-
-        check_button = button("Run selected lesson's checks", check_file, "suggested-action")
-        check_button.set_sensitive(False)
+        exercise_choice = Gtk.DropDown(model=Gtk.StringList.new(["Select an optional lesson check"]
+                                                               + [entry.title for entry in entries]))
 
         def clear_review(*_args):
             self.cancel_tutor()
@@ -1410,26 +1552,75 @@ class TutorWindow(Adw.ApplicationWindow):
                 answer.remove(child)
             review_status.set_text("")
 
-        def select_lesson(chooser, _property):
+        def preview(*_args):
+            nonlocal evidence
+            evidence = None
             clear_review()
             output_title.set_text("")
             output.set_text("")
-            check_button.set_sensitive(source is not None and chooser.get_selected() != 0)
+            index = display_choice.get_selected()
+            item = files[index] if index < len(files) else None
+            buffer.set_text(item.source if item else "")
+            check_button.set_sensitive(bool(item and item.path.suffix == ".rs" and exercise_choice.get_selected()))
 
-        exercise_choice.connect("notify::selected", select_lesson)
-        behavior.connect("changed", clear_review)
+        def set_files(selection):
+            nonlocal files
+            files = selection
+            names = [f"{index}. {item.path.name} · {item.size:,} bytes" for index, item in enumerate(files, start=1)]
+            display_choice.set_model(Gtk.StringList.new(names or ["No file selected"]))
+            file_status.set_text(f"{len(files)} file(s) · {sum(len(item.source) for item in files):,}/{REVIEW_LIMIT:,} "
+                                 "characters for tutor review" if files else "No project files selected.")
+            review_button.set_sensitive(self.tutor_configured() and any(item.path.suffix == ".rs" for item in files)
+                                        and sum(len(item.source) for item in files) <= REVIEW_LIMIT)
+            preview()
+
+        def choose_files():
+            dialog = Gtk.FileDialog(title="Choose saved Rust project files")
+            rust_filter = Gtk.FileFilter(name="Rust sources and Cargo manifest")
+            rust_filter.add_pattern("*.rs")
+            rust_filter.add_pattern("Cargo.toml")
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            filters.append(rust_filter)
+            dialog.set_filters(filters)
+
+            def opened(chooser, result):
+                if revision != self.page_revision:
+                    return
+                try:
+                    selection = chooser.open_multiple_finish(result)
+                    if selection is None:
+                        return
+                    if selection.get_n_items() > MAX_FILES:
+                        raise ValueError(f"Choose at most {MAX_FILES} project files.")
+                    paths = [selection.get_item(i).get_path() for i in range(selection.get_n_items())]
+                    if not all(paths):
+                        raise ValueError("Choose project files on this computer.")
+                    set_files(read_selection(paths))
+                except GLib.Error as error:
+                    if not error.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
+                        review_status.set_text(error.message)
+                except (OSError, ValueError) as error:
+                    review_status.set_text(f"Could not open selection. {error}")
+
+            dialog.open_multiple(self, None, opened)
+
+        def check_file():
+            nonlocal evidence
+            index, exercise = display_choice.get_selected(), exercise_choice.get_selected()
+            if not exercise or index >= len(files) or files[index].path.suffix != ".rs":
+                return
+            clear_review()
+            lesson, item = entries[exercise - 1], files[index]
+            record = self.progress.lesson(self.language, lesson.id)
+            self.run_exercise(lesson, item.source, record, "review", output_title, output)
+            evidence = f"Selection {index + 1} ({item.path.name})\n{output_title.get_text()}\n{output.get_text()}"[:700]
 
         def review():
             def task():
-                if not source:
-                    raise ValueError("Choose a saved Rust source file first.")
-                if len(source) > REVIEW_LIMIT:
-                    raise ValueError(f"Choose a Rust file of at most {REVIEW_LIMIT:,} characters for tutor review.")
                 index = exercise_choice.get_selected()
                 lesson = entries[index - 1] if index else None
-                evidence = f"{output_title.get_text()}\n{output.get_text()}"[:700] if output_title.get_text() else None
                 return guidance_task(self.chapters.values(), behavior.get_text().strip(), lesson=lesson,
-                                     source=source, evidence=evidence)
+                                     files=review_payload(files), evidence=evidence)
 
             def receive(response):
                 value, model_status = response
@@ -1440,23 +1631,31 @@ class TutorWindow(Adw.ApplicationWindow):
 
             self.ask_model(task, receive, review_status, cancel)
 
-        article.append(button("Choose a saved Rust file…", choose_file))
+        check_button = button("Run lesson checks on the previewed file", check_file)
+        review_button = button("Review selected files with the tutor", review, "suggested-action")
+        display_choice.connect("notify::selected", preview)
+        exercise_choice.connect("notify::selected", preview)
+        behavior.connect("changed", clear_review)
+        set_files(())
+        article.append(button("Choose saved project files…", choose_files))
+        article.append(button("Clear selection", lambda: set_files(()), "flat"))
         article.append(file_status)
-        article.append(preview)
+        article.append(display_choice)
+        article.append(previews)
         article.append(exercise_choice)
         article.append(check_button)
         article.append(output_title)
         article.append(output)
         article.append(Gtk.Separator())
-        article.append(label("Review with the local tutor", "title-3"))
-        article.append(label("Review gives the local model the selected file, your expected behavior, and any shown lesson checks. "
-                             "The tutor reads one file. You run project tests in your editor."))
+        article.append(label("Review with the tutor", "title-3"))
+        if self.tutor_configured():
+            article.append(label(f"Review sends the selected file names and contents, your expected behavior, and any "
+                                 f"shown lesson checks to {self.tutor_destination()}."))
+        else:
+            article.append(button("Configure the tutor", self.open_models, "flat"))
+        article.append(label("Use your editor terminal to run the full project and its tests.", "dim-label"))
         article.append(behavior)
-        review_ai = button("Review project with the tutor", review)
-        review_ai.set_sensitive(self.tutor_configured())
-        article.append(review_ai)
-        if not self.tutor_configured():
-            article.append(button("Configure the local tutor", self.open_models, "flat"))
+        article.append(review_button)
         article.append(cancel)
         article.append(review_status)
         article.append(answer)
@@ -1487,7 +1686,7 @@ class TutorWindow(Adw.ApplicationWindow):
         article.append(tutor_recommendation)
         self.managed_model_setup(article, "tutor", TUTORS, LLAMA_RELEASE)
         tutor = self.progress.data.get("tutor", {})
-        external = Gtk.Expander(label="Use a separate LM Studio server",
+        external = Gtk.Expander(label="Use LM Studio on this computer or on your LAN",
                                 expanded=bool(tutor and tutor.get("backend") != "managed"))
         external_controls = column(10)
         external_controls.set_margin_top(10)
@@ -1603,7 +1802,7 @@ class TutorWindow(Adw.ApplicationWindow):
             if not ready(preset):
                 return
             if is_tutor:
-                self.tutor_token = ""
+                self.tutor_session = None
                 self.progress.data["tutor"] = {"backend": "managed", "model": preset.key}
             else:
                 self.narrator.stop()
@@ -1615,7 +1814,7 @@ class TutorWindow(Adw.ApplicationWindow):
             self.cancel_tutor()
             self.narrator.stop()
             if is_tutor:
-                self.tutor_token = ""
+                self.tutor_session = None
                 self.progress.data.pop("tutor", None)
             else:
                 self.progress.data.pop("speech_backend", None)
@@ -1689,43 +1888,74 @@ class TutorWindow(Adw.ApplicationWindow):
         config = self.progress.data.get("tutor", {})
         if config.get("backend") == "managed":
             config = {}
-        article.append(label("Start LM Studio’s local server with local-network sharing off. "
-                             "Rust Tutor connects to 127.0.0.1. Choose a GGUF model you already downloaded in LM Studio. "
-                             "Exercise checks and authored hints remain available while the tutor is off."))
-        cli_status = "LM Studio CLI found" if cli_available() else "LM Studio CLI not detected"
-        article.append(label(cli_status, "dim-label"))
-        port = Gtk.Entry(text=str(config.get("port", DEFAULT_PORT)), max_length=5,
-                         input_purpose=Gtk.InputPurpose.DIGITS)
-        token = Gtk.PasswordEntry(text=self.tutor_token, show_peek_icon=True, hexpand=True)
+        saved_host = config.get("host", LOOPBACK)
+        saved_port = config.get("port", DEFAULT_PORT)
+        article.append(label("Start the LM Studio server in the Developer tab. Download a GGUF instruction model "
+                             "in LM Studio first. Checking the connection only lists models."))
+        mode = Gtk.DropDown(model=Gtk.StringList.new(["This computer", "Another computer on my home network"]),
+                            selected=int(saved_host != LOOPBACK))
+        guide = column(8)
+        guide.append(label("On the other computer, open Developer → Server Settings. Turn on Serve on Local Network "
+                           "and Require Authentication, then use Manage Tokens to create an API token for Rust Tutor. "
+                           "Start the server. Copy the private IPv4 address and port shown in the API URL. "
+                           "If LM Studio shows 0.0.0.0, find the other computer’s IPv4 address in its Wi-Fi or Ethernet settings."))
+        guide.append(label("Use a trusted home network and keep the server off the internet. Avoid port forwarding. "
+                           "This connection uses HTTP, so devices that can inspect network traffic can read the token "
+                           "and anything you send. To keep files on this computer, use the built-in tutor."))
+        guide.append(Gtk.LinkButton(uri="https://lmstudio.ai/docs/developer/core/server/serve-on-network",
+                                    label="LM Studio LAN setup", halign=Gtk.Align.START))
+        host = Gtk.Entry(text=saved_host if saved_host != LOOPBACK else "", max_length=15,
+                         placeholder_text="Example 192.168.1.25")
+        guide.append(label("IPv4 address from LM Studio"))
+        guide.append(host)
+        port = Gtk.Entry(text=str(saved_port), max_length=5, input_purpose=Gtk.InputPurpose.DIGITS)
+        token = Gtk.PasswordEntry(text=self.session_token(saved_host, saved_port), show_peek_icon=True, hexpand=True)
         selection = Gtk.DropDown()
-        context = Gtk.DropDown(model=Gtk.StringList.new(["4,096 tokens", "8,192 tokens"]))
-        context.set_selected(1 if config.get("context") == CONTEXTS[1] else 0)
+        context = Gtk.DropDown(model=Gtk.StringList.new(["4,096 tokens", "8,192 tokens"]),
+                               selected=int(config.get("context") == CONTEXTS[1]))
         status = label()
         recommendation = label(style="dim-label")
-        configured = label(style="heading")
+        selected_model = label(style="heading")
         models = []
+        checked_endpoint = None
+        cancel = self.cancel_control(status, "Cancel connection check")
 
         def reflect_saved():
-            saved = self.progress.data.get("tutor")
-            enabled = saved and saved.get("backend") != "managed"
-            configured.set_text(f"Configured model · {saved['model']}" if enabled else "Separate server disabled")
+            if config.get("model"):
+                text = f"Selected model · {config['model']} · {saved_host}:{saved_port}"
+                if (saved_host != LOOPBACK or config.get("requires_token")) and not self.session_token(saved_host, saved_port):
+                    text += " · re-enter token to reconnect"
+                selected_model.set_text(text)
+            else:
+                selected_model.set_text("No separate server selected")
 
         def endpoint():
             try:
                 value = int(port.get_text().strip())
             except ValueError:
-                raise TutorError("Enter a numeric local server port.") from None
-            return Settings(value, "", CONTEXTS[context.get_selected()], token.get_text().strip())
+                raise TutorError("Enter the port number shown by LM Studio.") from None
+            address = host.get_text().strip() if mode.get_selected() == 1 else LOOPBACK
+            if mode.get_selected() == 1 and address == LOOPBACK:
+                raise TutorError("Enter the private IPv4 address of the other computer.")
+            return Settings(value, "", CONTEXTS[context.get_selected()], token.get_text().strip(), address)
 
-        def reset_models(*_args):
+        def invalidate(*_args):
+            nonlocal checked_endpoint
             self.cancel_tutor()
+            checked_endpoint = None
             models.clear()
             selection.set_model(Gtk.StringList.new(["Check the connection to list models"]))
             save_model.set_sensitive(False)
             recommendation.set_text("")
             status.set_text("")
 
+        def changed(*_args):
+            guide.set_visible(mode.get_selected() == 1)
+            token.set_text("")
+            invalidate()
+
         def refresh():
+            invalidate()
             try:
                 settings = endpoint()
             except TutorError as error:
@@ -1733,44 +1963,47 @@ class TutorWindow(Adw.ApplicationWindow):
                 return
 
             def receive(installed):
+                nonlocal checked_endpoint
+                checked_endpoint = settings
                 models[:] = installed
-                save_model.set_sensitive(bool(installed))
                 selection.set_model(Gtk.StringList.new([model.description for model in installed]
                                                        or ["No supported models found"]))
+                save_model.set_sensitive(bool(installed))
                 if not installed:
-                    status.set_text("Server available. Download a GGUF instruction model yourself in LM Studio, then recheck.")
-                    recommendation.set_text("")
+                    status.set_text("Server reached. Download a GGUF instruction model in LM Studio, then check again.")
                     return
-                _, available = memory()
-                suggested = next((model for model in installed
-                                  if available is not None and model.size / 1024 ** 3 < max(available - 2, 0)), None)
-                current = self.progress.data.get("tutor", {})
-                saved = current.get("model") if current.get("port") == settings.port else None
-                preferred = next((model for model in installed if model.key == saved), None) or suggested or installed[0]
+                preferred = next((model for model in installed
+                                  if (settings.host, settings.port) == (saved_host, saved_port)
+                                  and model.key == config.get("model")), installed[0])
                 selection.set_selected(installed.index(preferred))
-                status.set_text("Server available. Choose which model to use for the tutor.")
-                if suggested:
-                    recommendation.set_text(f"Low-memory starting point · {suggested.name} with 4,096 tokens. "
-                                            "Model file size gives a rough estimate. Actual RAM and GPU use can be higher.")
+                status.set_text(f"Server reached at {settings.host}:{settings.port}. Choose a model.")
+                if settings.host == LOOPBACK:
+                    _, available = memory()
+                    if available is not None and preferred.size / 1024 ** 3 >= max(available - 2, 0):
+                        recommendation.set_text("This computer may need a smaller model. Check available RAM before loading.")
                 else:
-                    recommendation.set_text("Available RAM does not clearly fit even the smallest listed model. "
-                                            "Try an especially small model or use authored hints and checks.")
+                    recommendation.set_text("Model RAM and GPU use are on the other computer. Start with a small model "
+                                            "and 4,096 tokens if its capacity is uncertain.")
 
             self.start_tutor_job(lambda job: list_models(settings, job), receive, status,
-                                 "Checking the local server…")
+                                 f"Checking {settings.host}:{settings.port}…", cancel)
 
         def configure():
-            index = selection.get_selected()
-            if index >= len(models):
-                return
             try:
                 settings = endpoint()
             except TutorError as error:
                 status.set_text(str(error))
                 return
-            self.tutor_token = settings.token
-            self.progress.data["tutor"] = {"backend": "lmstudio", "port": settings.port, "model": models[index].key,
-                                           "context": settings.context}
+            index = selection.get_selected()
+            if (index >= len(models) or checked_endpoint is None
+                    or (settings.host, settings.port, settings.token) !=
+                       (checked_endpoint.host, checked_endpoint.port, checked_endpoint.token)):
+                status.set_text("Check the current connection before selecting a model.")
+                return
+            self.tutor_session = (settings.host, settings.port, settings.token)
+            self.progress.data["tutor"] = {"backend": "lmstudio", "host": settings.host, "port": settings.port,
+                                           "model": models[index].key, "context": settings.context,
+                                           "requires_token": bool(settings.token)}
             self.save()
             self.open_models()
 
@@ -1778,33 +2011,36 @@ class TutorWindow(Adw.ApplicationWindow):
             self.cancel_tutor()
             if self.progress.data.get("tutor", {}).get("backend") != "managed":
                 self.progress.data.pop("tutor", None)
-            self.tutor_token = ""
-            token.set_text("")
-            reset_models()
+            self.tutor_session = None
             self.save()
-            reflect_saved()
-            status.set_text("The tutor is off. Manage any independently loaded models in LM Studio.")
+            self.open_models()
 
         save_model = button("Use selected model", configure)
-        reset_models()
+        invalidate()
         reflect_saved()
-        port.connect("changed", reset_models)
-        token.connect("changed", reset_models)
-        article.append(configured)
-        article.append(label("Port on 127.0.0.1"))
+        guide.set_visible(mode.get_selected() == 1)
+        mode.connect("notify::selected", changed)
+        for field in (host, port):
+            field.connect("changed", changed)
+        token.connect("changed", invalidate)
+        article.append(selected_model)
+        article.append(label("Where is LM Studio running?"))
+        article.append(mode)
+        article.append(guide)
+        article.append(label("Server port"))
         article.append(port)
-        article.append(label("API token if required (current app session only)"))
+        article.append(label("API token (required on the LAN, kept only for this app session)"))
         article.append(token)
         article.append(button("Check connection and models", refresh, "suggested-action"))
+        article.append(cancel)
         article.append(selection)
         article.append(recommendation)
         article.append(label("Context for a model loaded by Rust Tutor"))
         article.append(context)
         article.append(save_model)
-        article.append(button("Turn local tutor off", disable, "flat"))
+        article.append(button("Disconnect LM Studio", disable, "flat"))
         article.append(status)
-        article.append(label("A request loads the chosen model only when needed and asks LM Studio to unload it afterward. "
-                             "A model already loaded in LM Studio stays under your control. You can stop the server there.",
-                             "dim-label"))
+        article.append(label("Rust Tutor requests inference when you ask and asks LM Studio to unload any instance "
+                             "it loaded. A model already loaded stays under your control in LM Studio.", "dim-label"))
         article.append(Gtk.LinkButton(uri="https://lmstudio.ai/docs/developer/rest/quickstart",
-                                      label="LM Studio’s local server setup", halign=Gtk.Align.START))
+                                      label="LM Studio server setup", halign=Gtk.Align.START))

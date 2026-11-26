@@ -73,6 +73,22 @@ def milestone_ready(course, milestone, lessons):
             and all(skill_progress(course, key, lessons).demonstrated for key in milestone.skill_ids))
 
 
+def concept_evidence(course, milestone, key):
+    saved = quiz_results(course, milestone)
+    return tuple(saved.get(item.id) for item in questions(milestone) if item.topic == key)
+
+
+def upcoming_project_topics(course, milestones, lessons):
+    roadmap = tuple(stage for stage in milestones if stage.outline)
+    for stage in roadmap:
+        remaining = tuple(topic for topic in stage.outline
+                          if not skill_progress(course, topic.id, lessons).demonstrated
+                          or not all(concept_evidence(course, stage, topic.id)))
+        if remaining:
+            return stage, remaining[:3], False
+    return roadmap[-1], roadmap[-1].outline, True
+
+
 def pacing_options(course, milestone, lessons):
     """Return eligible fixed skill IDs, with the concept/behavior evidence scoped to this milestone."""
     concepts = quiz_results(course, milestone)

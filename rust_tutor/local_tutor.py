@@ -1,21 +1,34 @@
-"""On-demand LM Studio client. All HTTP goes directly to IPv4 loopback."""
+"""On-demand LM Studio client for loopback or a selected home-network address."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import http.client
+from ipaddress import IPv4Address, IPv4Network
 import json
-from pathlib import Path
-import shutil
 import socket
 from threading import Event, Lock
 
 
 DEFAULT_PORT = 1234
+LOOPBACK = "127.0.0.1"
+HOME_NETWORKS = tuple(map(IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
 CONTEXTS = (4096, 8192)
 REVIEW_LIMIT = 6_000
 
 
 class TutorError(RuntimeError):
     pass
+
+
+def lan_address(value):
+    if not isinstance(value, str):
+        raise TutorError("Enter the home-network IPv4 address shown by LM Studio.")
+    try:
+        address = IPv4Address(value)
+    except (ValueError, TypeError):
+        raise TutorError("Enter the home-network IPv4 address shown by LM Studio, without http:// or the port.") from None
+    if not any(address in network for network in HOME_NETWORKS):
+        raise TutorError("Choose a private home-network IPv4 address, such as 192.168.1.25.")
+    return str(address)
 
 
 @dataclass(frozen=True)
@@ -37,20 +50,20 @@ class Settings:
     port: int
     model: str
     context: int
-    token: str = ""
+    token: str = field(default="", repr=False)
+    host: str = LOOPBACK
 
     def __post_init__(self):
+        if self.host != LOOPBACK:
+            lan_address(self.host)
+            if not self.token:
+                raise TutorError("Enter the LM Studio API token for this LAN server.")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
-            raise TutorError("Enter a local server port from 1 to 65535.")
+            raise TutorError("Enter a server port from 1 to 65535.")
         if self.context not in CONTEXTS:
             raise TutorError("Choose one of the listed context sizes.")
         if len(self.token) > 1024 or any(not 33 <= ord(char) <= 126 for char in self.token):
             raise TutorError("Enter the LM Studio API token without spaces.")
-
-
-def cli_available():
-    bundled_cli = Path.home() / ".lmstudio/bin/lms"
-    return bool(shutil.which("lms") or shutil.which(str(bundled_cli)))
 
 
 class Request:
@@ -86,9 +99,9 @@ class Request:
 
 def api(settings, path, payload=None, *, timeout=4, request=None):
     # HTTPConnection doesn't use proxies, resolve a user-supplied hostname, or follow redirects.
-    connection = http.client.HTTPConnection("127.0.0.1", settings.port, timeout=timeout)
+    connection = http.client.HTTPConnection(settings.host, settings.port, timeout=timeout)
     return request_json(connection, path, payload, token=settings.token, request=request,
-                        service=f"LM Studio at 127.0.0.1:{settings.port}")
+                        service=f"LM Studio at {settings.host}:{settings.port}")
 
 
 def request_json(connection, path, payload=None, *, token="", request=None, service="The local runtime"):
@@ -113,21 +126,21 @@ def request_json(connection, path, payload=None, *, token="", request=None, serv
             raise TutorError(f"{service} returned HTTP {response.status}. Check Model setup.")
         data = response.read(512 * 1024 + 1)
         if len(data) > 512 * 1024:
-            raise TutorError("The local server returned an unexpectedly large response.")
+            raise TutorError(f"{service} returned an unexpectedly large response.")
         value = json.loads(data)
         if not isinstance(value, dict):
-            raise TutorError("The local server did not return a JSON object.")
+            raise TutorError(f"{service} did not return a JSON object.")
         return value
     except TimeoutError:
         if request:
             request.check()
-        raise TutorError("The local server timed out. Check its model state in Model setup.") from None
+        raise TutorError(f"{service} timed out. Check its connection and model state in Model setup.") from None
     except (OSError, http.client.HTTPException):
         if request:
             request.check()
         raise TutorError(f"Could not reach {service}. Check Model setup.") from None
     except (ValueError, RecursionError):
-        raise TutorError("The local server did not return valid JSON.") from None
+        raise TutorError(f"{service} did not return valid JSON.") from None
     finally:
         if request:
             request.detach()
@@ -151,7 +164,7 @@ def decode_completion(answer, task):
     try:
         choice = answer["choices"][0]
         if choice.get("finish_reason") == "length":
-            raise TutorError("The model ran out of response space. Try a smaller question or a shorter file.")
+            raise TutorError("The model ran out of response space. Try a smaller request or a model with more context.")
         return task.validate(json.loads(choice["message"]["content"]))
     except (KeyError, IndexError, AttributeError, TypeError, ValueError, RecursionError):
         raise TutorError("The model did not return usable structured guidance. Try again or choose another local model.") from None
@@ -189,7 +202,7 @@ def generate(settings, request, task):
     models = list_models(settings, request)
     model = next((item for item in models if item.key == settings.model), None)
     if model is None:
-        raise TutorError("The configured model is not in the local model list. Choose an installed model in Model setup.")
+        raise TutorError("The configured model is missing from the server’s model list. Choose an installed model in Model setup.")
 
     request.check()
     instance = model.instance
