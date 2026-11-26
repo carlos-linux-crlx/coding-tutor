@@ -78,5 +78,5 @@ SPEECH = Preset(
     "speech", "Piper · LJ Speech (US English)",
     "A separate one-CPU voice for lesson and reference prose. It loads only for read-aloud.",
     1.25, 1024, (PIPER, VOICE, VOICE_CONFIG), f"{VOICE_BASE}/tree/{VOICE_REV}/{VOICE_FOLDER}",
-    "MIT runtime and voice release · public-domain training data",
+    "Piper v1.2.0 MIT project; archive dependencies have separate licenses · MIT voice repository; LJ Speech dataset marked public domain",
 )
