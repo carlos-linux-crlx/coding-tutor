@@ -1,4 +1,4 @@
-"""A bounded interpreter for the Rust constructs used in the first milestone.
+"""A bounded interpreter for the first five Rust exercises.
 
 The parser accepts a small grammar. It never invokes a compiler, shell, or
 executable, and its evaluator has no interface to files or the environment.
@@ -25,6 +25,12 @@ RESERVED = set("as async await break const continue crate dyn else enum extern f
                "abstract become box do final gen macro override priv try typeof unsized virtual yield _".split())
 MIN_I32 = -(2 ** 31)
 MAX_I32 = 2 ** 31 - 1
+FUNCTIONS = {
+    "bindings": ("stockroom", ("i32",), "i32"),
+    "expressions": ("packed_lunches", ("i32",), "i32"),
+    "functions": ("add", ("i32", "i32"), "i32"),
+    "calculator": ("calculate", ("i32", "&str", "i32"), "Result"),
+}
 
 
 @dataclass(frozen=True)
@@ -114,18 +120,23 @@ class Parser:
                 self.expect(")", ";")
             self.expect("")
             return (), ("literal", "\n".join(lines))
-        function = "add" if lesson_id == "functions" else "calculate"
+        if lesson_id not in FUNCTIONS:
+            self.fail("run this exercise in your Cargo project")
+        function, types, return_type = FUNCTIONS[lesson_id]
         self.expect("fn", function, "(")
-        parameters = [self.name()]
-        self.expect(":", "i32", ",")
-        if function == "calculate":
+        parameters = []
+        for index, kind in enumerate(types):
+            if index:
+                self.expect(",")
             parameters.append(self.name())
-            self.expect(":", "&", "str", ",")
-        parameters.append(self.name())
-        self.expect(":", "i32")
+            self.expect(":")
+            if kind == "&str":
+                self.expect("&", "str")
+            else:
+                self.expect(kind)
         self.accept(",")
         self.expect(")", "->")
-        if function == "add":
+        if return_type == "i32":
             self.expect("i32")
         else:
             self.expect("Result", "<", "i32", ",", "&", "'", "static", "str", ">")
@@ -140,8 +151,12 @@ class Parser:
         bindings = []
         while self.accept("let"):
             name = self.name()
+            annotation = None
+            if self.accept(":"):
+                self.expect("i32")
+                annotation = "i32"
             self.expect("=")
-            bindings.append((name, self.expression()))
+            bindings.append((name, annotation, self.expression()))
             self.expect(";")
         returned = self.accept("return")
         result = self.expression()
@@ -266,8 +281,11 @@ def expression_type(node, scope, return_type):
             return "bool" if OPERATORS[symbol] == 1 else "i32"
         case ("block", bindings, result, returned):
             scope = scope.copy()
-            for name, child in bindings:
-                scope[name] = infer(child)
+            for name, annotation, child in bindings:
+                kind = infer(child)
+                if annotation:
+                    require_type(kind, annotation)
+                scope[name] = kind
             result_type = infer(result)
             if returned:
                 require_type(result_type, return_type)
@@ -334,7 +352,7 @@ def evaluate(node, scope):
             return operation(symbol, evaluate(left, scope), evaluate(right, scope))
         case ("block", bindings, result, returned):
             local = scope.copy()
-            for name, child in bindings:
+            for name, _, child in bindings:
                 local[name] = evaluate(child, local)
             value = evaluate(result, local)
             if returned:
@@ -363,26 +381,22 @@ def evaluate(node, scope):
 def check(lesson, source, sample=False):
     try:
         parameters, body = Parser(source).program(lesson.id)
-        if lesson.id == "functions":
-            scope = dict.fromkeys(parameters, "i32")
-            require_type(expression_type(body, scope, "i32"), "i32")
-        elif lesson.id == "calculator":
-            scope = dict(zip(parameters, ("i32", "&str", "i32")))
-            require_type(expression_type(body, scope, "Result"), "Result")
+        types, return_type = FUNCTIONS[lesson.id][1:] if lesson.id != "first-program" else ((), None)
+        if return_type:
+            scope = dict(zip(parameters, types))
+            require_type(expression_type(body, scope, return_type), return_type)
         cases = lesson.cases[:1] if sample else lesson.cases
         results = []
         for case in cases:
-            arguments = [
-                value if lesson.id == "calculator" and i == 1 else int(value)
-                for i, value in enumerate(case.arguments)
-            ]
+            arguments = [int(value) if kind == "i32" else value
+                         for kind, value in zip(types, case.arguments, strict=True)]
             try:
                 value = evaluate(body, dict(zip(parameters, arguments)))
             except Returned as result:
                 value = result.value
-            if lesson.id == "functions":
+            if return_type == "i32":
                 value = integer(value)
-            if lesson.id == "calculator":
+            if return_type == "Result":
                 if not isinstance(value, tuple):
                     raise ExerciseError("Return Ok(number) or Err(reason) from calculate.")
                 variant, payload = value

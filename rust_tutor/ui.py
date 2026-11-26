@@ -1,4 +1,4 @@
-"""Native GTK and libadwaita interface for the first Rust milestone."""
+"""Native GTK and libadwaita interface for Rust Tutor."""
 
 import hashlib
 import logging
@@ -15,15 +15,16 @@ from gi.repository import Adw, Gio, GLib, Gtk
 from .course import COURSES
 from .exercises import ExerciseError, check
 from .hardware import assessment, memory, piper_command, valid_voice
+from .learning import milestone_ready, pacing_options, questions, quiz_results, quiz_score, skill_progress
 from .local_tutor import CONTEXTS, DEFAULT_PORT, REVIEW_LIMIT, Request, Settings, TutorError, cli_available, generate, list_models
 from .managed_runtime import generate_managed
 from .model_catalog import LLAMA_RELEASE, PIPER_RELEASE, SPEECH, TUTORS
 from .model_manager import install, model_directory, need_resources, ready, remaining
 from .project_path import FOCUSES, propose_path
-from .reference import printable_reference
+from .reference import print_sheet, printable_reference, printable_sheet
 from .speech import Narrator
 from .state import Progress
-from .tutor_tasks import guidance_task, project_task
+from .tutor_tasks import guidance_task, pace_task, project_task, report_task
 
 
 def column(spacing=12):
@@ -90,6 +91,8 @@ class TutorWindow(Adw.ApplicationWindow):
         self.course = COURSES[self.language]
         self.lessons = {lesson.id: lesson for lesson in self.course["lessons"]}
         self.chapters = {chapter.id: chapter for chapter in self.course["chapters"]}
+        self.milestones = {stage.id: stage for stage in self.course["milestones"]}
+        self.topics = {topic.id: topic for stage in self.milestones.values() for topic in stage.outline}
         self.progress = Progress()
         self.narrator = Narrator()
         self.tutor_job = None
@@ -147,13 +150,13 @@ class TutorWindow(Adw.ApplicationWindow):
         outer.append(self.navigation)
         for lesson in self.lessons.values():
             self.nav_row(lesson.id, lesson.title, lambda item=lesson: self.open_lesson(item))
-        self.nav_row("quiz", "Milestone quiz", self.open_quiz)
+        self.nav_row("quiz", "Milestones and progress", self.open_milestones)
         self.navigation.append(Gtk.Separator(margin_top=12, margin_bottom=12))
         separator = self.navigation.get_row_at_index(len(self.sidebar_rows))
         separator.set_selectable(False)
         separator.set_activatable(False)
         self.nav_row("reference", "Rust reference", self.open_reference, "help-browser-symbolic")
-        self.nav_row("next", "Path and editor setup", self.open_path, "folder-documents-symbolic")
+        self.nav_row("next", "Course roadmap", self.open_path, "folder-documents-symbolic")
         self.nav_row("projects", "Project paths", self.open_project_paths, "document-new-symbolic")
         self.nav_row("tutor", "Ask tutor", self.open_tutor, "help-about-symbolic")
         self.nav_row("handoff", "Review from editor", self.open_editor_review, "document-open-symbolic")
@@ -177,7 +180,7 @@ class TutorWindow(Adw.ApplicationWindow):
         title.set_hexpand(True)
         body.append(title)
         status = Gtk.Image.new_from_icon_name("object-select-symbolic")
-        status.set_tooltip_text("Exercise passed")
+        status.set_tooltip_text("Exercise complete")
         status.set_visible(False)
         body.append(status)
         row.set_child(body)
@@ -213,18 +216,18 @@ class TutorWindow(Adw.ApplicationWindow):
     def update_progress(self):
         complete = 0
         for lesson in self.lessons.values():
-            record = self.progress.lesson(self.language, lesson.id)
-            passed = bool(record.get("passed"))
+            passed = self.foundation_complete(lesson.id)
             self.sidebar_rows[lesson.id][1].set_visible(passed)
             complete += int(passed)
-        self.summary.set_text(f"{complete} of {len(self.lessons)} exercises complete")
+        self.summary.set_text(f"{complete} of {len(self.lessons)} foundations complete")
 
     def document(self, key, title, show=True):
         self.narrator.stop()
         self.page_revision += 1
         self.cancel_tutor()
         self.page.set_title(title)
-        self.navigation.select_row(self.sidebar_rows[key][0])
+        if key is not None:
+            self.navigation.select_row(self.sidebar_rows[key][0])
         if show:
             self.split.set_show_content(True)
 
@@ -354,7 +357,8 @@ class TutorWindow(Adw.ApplicationWindow):
                 raise ValueError("Enter a Rust question.")
             if review and len(review[0]) > REVIEW_LIMIT:
                 raise ValueError(f"Keep the lesson draft to {REVIEW_LIMIT:,} characters for tutor review.")
-            attempts = self.progress.lesson(self.language, lesson.id).get("attempts", 0) if lesson else 0
+            record = self.progress.lesson(self.language, lesson.id) if lesson else {}
+            attempts = record.get("failed_checks", 0) if lesson and lesson.editor_checks else record.get("attempts", 0)
             return guidance_task(self.chapters.values(), text, lesson=lesson, attempt=attempts,
                                  source=review[0] if review else None, evidence=review[1] if review else None,
                                  previous=previous)
@@ -431,10 +435,81 @@ class TutorWindow(Adw.ApplicationWindow):
                 article.append(label(name, "heading"))
                 article.append(label(description, "learning-body"))
         article.append(button("Open related reference", lambda: self.open_reference(lesson.reference), "flat"))
+        if lesson.id == "cargo-setup":
+            article.append(button("Crate documentation and Rust tools", lambda: self.open_reference("resources"), "flat"))
 
         article.append(Gtk.Separator())
         article.append(label("Practice", "title-2"))
         article.append(label(lesson.exercise, "learning-body"))
+        if lesson.editor_checks:
+            self.editor_practice(article, lesson, record)
+        else:
+            self.in_app_practice(article, lesson, record)
+        article.append(button("Ask the local tutor", lambda: self.open_tutor(lesson), "flat"))
+        stage = next(stage for stage in self.milestones.values() if lesson.id in stage.skill_ids)
+        article.append(button("Chapter cheat sheet", lambda: self.open_cheat_sheet(
+            stage.title, stage.cheat_sheet, lambda: self.open_lesson(lesson)), "flat"))
+        if lesson.id == stage.skill_ids[-1]:
+            article.append(button("Open milestone and progress", lambda: self.open_milestone(stage), "suggested-action"))
+        ids = list(self.lessons)
+        index = ids.index(lesson.id)
+        if index < len(ids) - 1:
+            article.append(button("Next lesson", lambda: self.open_lesson(self.lessons[ids[index + 1]]), "flat"))
+        else:
+            article.append(button("Open the course roadmap", self.open_path, "flat"))
+
+    def editor_practice(self, article, lesson, record):
+        article.append(label("Run your code in the Cargo project you open in VS Code or VSCodium. "
+                             "Record the behavior you observed. Rust Tutor leaves the project execution to you.", "dim-label"))
+        if lesson.starter:
+            starter, _ = code_view(lesson.starter)
+            article.append(starter)
+        self.practice_observations(article, lesson.editor_checks, record, self.update_progress)
+        tip = label()
+        count = 0
+
+        def hint():
+            nonlocal count
+            if count < len(lesson.hints):
+                tip.set_text(lesson.hints[count])
+                count += 1
+                record["hints_used"] = record.get("hints_used", 0) + 1
+                self.save()
+
+        article.append(button("Get a hint", hint, "flat"))
+        article.append(tip)
+        article.append(button("Review a saved Rust file", self.open_editor_review, "flat"))
+
+    def practice_observations(self, article, criteria, record, refresh):
+        marks = record.get("observations", {})
+        choices = ("Unrecorded", "Observed as expected", "Tried, needs practice")
+        for index, criterion in enumerate(criteria):
+            key = str(index)
+            article.append(label(criterion))
+            value = marks.get(key)
+            field = Gtk.DropDown(model=Gtk.StringList.new(choices),
+                                 selected=0 if value is None else 1 if value else 2,
+                                 halign=Gtk.Align.START)
+            field.set_tooltip_text(criterion)
+
+            def changed(control, _property, item=key):
+                selected = control.get_selected()
+                saved = record.setdefault("observations", {})
+                if not selected:
+                    saved.pop(item, None)
+                else:
+                    saved[item] = selected == 1
+                    if selected == 2:
+                        record["failed_checks"] = record.get("failed_checks", 0) + 1
+                if all(saved.get(str(index)) is True for index in range(len(criteria))):
+                    record["passed"] = True
+                self.save()
+                refresh()
+
+            field.connect("notify::selected", changed)
+            article.append(field)
+
+    def in_app_practice(self, article, lesson, record):
         article.append(label("Run and Check use a limited Rust interpreter. They evaluate the exercise in the app "
                              "without invoking rustc or launching your code. The editor guide covers compiling full Rust projects.", "dim-label"))
         editor_frame, buffer = code_view(record.get("draft", lesson.starter), editable=True)
@@ -492,6 +567,9 @@ class TutorWindow(Adw.ApplicationWindow):
                     )
                 else:
                     message = f"Hint {index + 1} of {len(lesson.hints)}\n{lesson.hints[index]}"
+                    if action == "hint":
+                        record["hints_used"] = record.get("hints_used", 0) + 1
+                        self.save()
                 feedback.set_text(message)
                 if solution_button is not None:
                     solution_button.set_visible(not passed and attempts >= len(lesson.hints))
@@ -506,46 +584,43 @@ class TutorWindow(Adw.ApplicationWindow):
         article.append(actions)
         article.append(result_card)
         article.append(tutor)
-        article.append(button("Ask the local tutor", lambda: self.open_tutor(lesson), "flat"))
-        ids = list(self.lessons)
-        index = ids.index(lesson.id)
-        if index < len(ids) - 1:
-            article.append(button("Next lesson", lambda: self.open_lesson(self.lessons[ids[index + 1]]), "flat"))
-        else:
-            article.append(button("Open milestone quiz", self.open_quiz, "flat"))
 
     def run_exercise(self, lesson, source, record, action, title, output):
         sample = action == "run"
+        passed_cases = 0
         try:
             results = check(lesson, source, sample=sample)
-            passed = all(case.matches(actual) for case, actual in results)
             rows = []
             for case, actual in results:
                 arguments = " ".join(case.arguments) or "Program output"
                 if sample:
                     rows.append(f"{arguments}\n{actual or '(no output)'}")
                 elif case.matches(actual):
+                    passed_cases += 1
                     rows.append(f"Pass · {arguments}\n{actual or '(no output)'}")
                 else:
                     rows.append(f"Try again · {arguments}\nExpected: {case.expected}\nGot: {actual or '(no output)'}")
             output.set_text("\n\n".join(rows))
+            passed = bool(results) and (sample or passed_cases == len(results))
             title.set_text("Sample output" if sample else "All checks passed" if passed else "Check the expected behavior")
         except ExerciseError as error:
             title.set_text("Practice editor diagnostic")
             output.set_text(str(error))
             passed = False
-        if sample:
+        if action in {"run", "hint"}:
             return passed
         if action in {"check", "review"}:
             record["latest_check"] = "passed" if passed else "needs practice"
+            record["passed_cases"] = passed_cases
         if passed:
             record["passed"] = True
             record["attempts"] = 0
             record.pop("last_failure", None)
-        elif action != "hint":
+        else:
             fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()
             if record.get("last_failure") != fingerprint:
                 record["attempts"] = record.get("attempts", 0) + 1
+                record["failed_checks"] = record.get("failed_checks", 0) + 1
                 record["last_failure"] = fingerprint
         if action == "review":
             record["review"] = "passed" if passed else "needs practice"
@@ -613,11 +688,16 @@ class TutorWindow(Adw.ApplicationWindow):
             for title, url in chapter.sources:
                 source = Gtk.LinkButton(uri=url, label=title, halign=Gtk.Align.START)
                 content.append(source)
+            if chapter.id == "cargo":
+                content.append(button("Open the Rust resources directory",
+                                      lambda: self.open_reference("resources"), "flat"))
+            content.append(button("Open chapter cheat sheet", lambda: self.open_cheat_sheet(
+                chapter.title, chapter.cheat_sheet, lambda: self.open_reference(chapter.id, return_action)), "flat"))
 
         def filter_row(row):
             query = search.get_text().strip().casefold()
             chapter = row.chapter
-            text = f"{chapter.title} {chapter.summary} {chapter.sections}"
+            text = f"{chapter.title} {chapter.summary} {chapter.sections} {chapter.cheat_sheet}"
             return all(word in text.casefold() for word in query.split())
 
         topics.set_filter_func(filter_row)
@@ -628,15 +708,61 @@ class TutorWindow(Adw.ApplicationWindow):
         render(first.chapter)
 
     def export_reference(self):
-        dialog = Gtk.FileDialog(title="Save printable Rust reference", initial_name="rust-reference.html")
+        content = printable_reference(self.chapters.values(), self.milestones.values())
+        self.export_printable("rust-reference.html", content)
+
+    def open_cheat_sheet(self, title, entries, back):
+        article = self.document(None, title)
+        article.append(label(title, "title-1"))
+        article.append(label("Rust cheat sheet", "title-3"))
+        for term, idea in entries:
+            article.append(label(term, "heading"))
+            article.append(label(idea, "learning-body"))
+        article.append(self.speech_controls(" ".join([title, *(f"{term}. {idea}" for term, idea in entries)])))
+        status = label()
+
+        def print_copy(pdf_path=None):
+            try:
+                done = print_sheet(self, title, entries, pdf_path)
+            except (ImportError, ValueError):
+                status.set_text("For the system print dialog or direct PDF export, install python3-gi-cairo. "
+                                "You can save the printable copy and use your browser’s Print or Save as PDF.")
+            except (GLib.Error, OSError) as error:
+                status.set_text(f"Couldn’t print this sheet. {error}")
+            else:
+                status.set_text("PDF saved." if done and pdf_path else "")
+
+        def save_pdf():
+            dialog = Gtk.FileDialog(title="Save Rust cheat sheet as PDF", initial_name="rust-cheat-sheet.pdf")
+
+            def selected(chooser, result):
+                try:
+                    location = chooser.save_finish(result)
+                    if location and location.get_path():
+                        print_copy(location.get_path())
+                except GLib.Error as error:
+                    if not error.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
+                        status.set_text(error.message)
+
+            dialog.save(self, None, selected)
+
+        article.append(button("Print…", print_copy, "suggested-action"))
+        article.append(button("Save as PDF…", save_pdf))
+        article.append(button("Save printable HTML…", lambda: self.export_printable(
+            "rust-cheat-sheet.html", printable_sheet(title, entries)), "flat"))
+        article.append(status)
+        article.append(button("Back to chapter", back, "flat"))
+
+    def export_printable(self, filename, content):
+        dialog = Gtk.FileDialog(title="Save printable copy", initial_name=filename)
 
         def save_file(chooser, result):
             try:
                 file = chooser.save_finish(result)
                 if not file or not file.get_path():
                     return
-                Path(file.get_path()).write_text(printable_reference(self.chapters.values()), encoding="utf-8")
-                self.toasts.add_toast(Adw.Toast(title="Reference saved. Open it in your browser to print or save as PDF."))
+                Path(file.get_path()).write_text(content, encoding="utf-8")
+                self.toasts.add_toast(Adw.Toast(title="Saved. Open the file in your browser to print or save as PDF."))
             except GLib.Error as error:
                 if not error.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
                     self.toasts.add_toast(Adw.Toast(title=error.message))
@@ -645,104 +771,406 @@ class TutorWindow(Adw.ApplicationWindow):
 
         dialog.save(self, None, save_file)
 
-    def open_quiz(self):
-        article = self.document("quiz", "Milestone quiz")
-        article.append(label("Rust foundations quiz", "title-1"))
-        article.append(label("Use these three questions to decide what to revisit after the calculator. "
-                             "Your project checks are the main sign of progress."))
-        controls = []
+    def open_milestones(self):
+        article = self.document("quiz", "Milestones and progress")
+        article.append(label("Milestones and progress", "title-1"))
+        article.append(label("Ready to move on means all required behavior checks passed and a complete concept quiz "
+                             "with at least 80% correct. Hints and retries describe support used."))
         course = self.progress.course(self.language)
-        previous = course.get("quiz", {})
-        for lesson_id, question, choices, correct, explanation in self.course["quiz"]:
-            group = column(8)
+        for stage in self.milestones.values():
+            ready = milestone_ready(course, stage, self.lessons)
+            article.append(button(f"{stage.title} · {'Ready to move on' if ready else 'View progress'}",
+                                  lambda item=stage: self.open_milestone(item), "flat"))
+
+    def open_milestone(self, stage):
+        article = self.document("quiz", stage.title)
+        course = self.progress.course(self.language)
+        adjustment = course.get("pacing", {}).get(stage.id, {})
+        plan = adjustment.get("saved", {}).get(adjustment.get("active"))
+        article.append(label(stage.title, "title-1"))
+        if stage.prerequisite:
+            prior = self.milestones[stage.prerequisite]
+            article.append(button(f"Prerequisite · {prior.title}", lambda: self.open_milestone(prior), "flat"))
+        article.append(label(f"What you’re working toward · {stage.endpoint}"))
+        report = column(8)
+        report.add_css_class("card")
+        report.add_css_class("lesson-card")
+        article.append(report)
+        report_note = label()
+        status = label()
+        cancel = self.cancel_control(status)
+
+        def refresh():
+            report_note.set_text("")
+            while (child := report.get_first_child()) is not None:
+                report.remove(child)
+            skills = {key: skill_progress(course, key, self.lessons) for key in stage.skill_ids}
+            correct, total, answered = quiz_score(course, stage)
+            ready = milestone_ready(course, stage, self.lessons)
+            evidence = quiz_results(course, stage)
+            opened = bool(answered or any(skill.tried or skill.passed for skill in skills.values()))
+            status_text = "Ready to move on" if ready else "Needs more practice" if opened else "Not yet covered"
+            report.append(label(status_text, "title-2"))
+            passed = sum(skill.passed for skill in skills.values())
+            required = sum(skill.required for skill in skills.values())
+            graph = Gtk.ProgressBar(show_text=True, fraction=passed / required,
+                                    text=f"Behavior checks · {passed}/{required}")
+            report.append(graph)
+            report.append(label(f"Concept quiz · {correct * 100 // total}% ({correct}/{total} correct, "
+                                f"{answered}/{total} answered)" if answered else "Concept quiz · No answers recorded"))
+            for key, skill in skills.items():
+                title = (self.lessons.get(key) or self.topics[key]).title
+                answers = [evidence.get(item.id) for item in questions(stage) if item.topic == key]
+                if skill.demonstrated and all(answers):
+                    rating = "Covered & demonstrated"
+                elif skill.tried or skill.passed or any(answer is not None for answer in answers):
+                    rating = "Needs practice"
+                else:
+                    rating = "Not yet covered"
+                if plan and plan["kind"] == "combine" and key in plan["skills"]:
+                    rating += f" · Combined into {plan['title']}"
+                report.append(label(f"{title} · {rating}"))
+            hints = sum(skill.hints for skill in skills.values())
+            retries = sum(skill.retries for skill in skills.values())
+            report.append(label(f"Support used · {hints} hints · {retries} unsuccessful check attempts", "dim-label"))
+            if stage.outline or any(self.lessons[key].editor_checks for key in stage.skill_ids):
+                report.append(label("Cargo checks are observations you record after running your own code.", "dim-label"))
+            report.append(label("You’ve demonstrated the required behavior. Carry it into the next project." if ready else
+                                "Try one small case at a time. Use the next unchecked behavior or the quiz to decide what to revisit."))
+
+        def ask_for_summary():
+            evidence = quiz_results(course, stage)
+            summary = []
+            for key in stage.skill_ids:
+                item = self.lessons.get(key) or self.topics[key]
+                skill = skill_progress(course, key, self.lessons)
+                summary.append({"id": key, "title": item.title, "checks_passed": skill.passed,
+                                "checks_required": skill.required, "hints": skill.hints, "failed_checks": skill.retries,
+                                "quiz": [evidence.get(q.id) for q in questions(stage) if q.topic == key]})
+            correct, total, answered = quiz_score(course, stage)
+            data = {"milestone": stage.title, "project": stage.endpoint, "skills": summary,
+                    "quiz": {"correct": correct, "total": total, "answered": answered},
+                    "ready": milestone_ready(course, stage, self.lessons)}
+
+            def receive(response):
+                advice, model_status = response
+                report_note.set_text(advice)
+                status.set_text(model_status)
+
+            self.ask_model(lambda: report_task(data), receive, status, cancel)
+
+        refresh()
+        article.append(button("Take concept quiz", lambda: self.open_quiz(stage), "suggested-action"))
+        if stage.outline:
+            correct, total, answered = quiz_score(course, stage, "transfer")
+            text = f"Follow-up quiz · {correct}/{total} correct" if answered else "Take follow-up quiz"
+            article.append(button(text, lambda: self.open_quiz(stage, "transfer"), "flat"))
+        article.append(button("Open chapter cheat sheet", lambda: self.open_cheat_sheet(
+            stage.title, stage.cheat_sheet, lambda: self.open_milestone(stage)), "flat"))
+        article.append(button("Review pace and practice options", lambda: self.open_pacing(stage), "flat"))
+        personalize = button("Ask tutor for a short chapter summary", ask_for_summary, "flat")
+        personalize.set_sensitive(self.tutor_configured())
+        article.append(personalize)
+        article.append(cancel)
+        article.append(status)
+        article.append(report_note)
+
+        if not stage.outline:
+            for key in stage.skill_ids:
+                lesson = self.lessons[key]
+                article.append(button(lesson.title, lambda item=lesson: self.open_lesson(item), "flat"))
+        else:
+            article.append(label("Core lesson outlines", "title-2"))
+            article.append(label("Study each idea and try its two checks in a local Cargo project. "
+                                 "You can use the chapter project to demonstrate both."))
+            combined_skills = plan["skills"] if plan and plan["kind"] == "combine" else ()
+            shared = column(12)
+            for topic in stage.outline:
+                if combined_skills and topic.id == combined_skills[0]:
+                    shared.add_css_class("card")
+                    shared.add_css_class("lesson-card")
+                    shared.append(label(plan["title"], "title-2"))
+                    shared.append(label(plan["reason"], "dim-label"))
+                    self.pace_activities(shared, plan)
+                    article.append(shared)
+                section = column(8)
+                if topic.id not in combined_skills:
+                    section.add_css_class("card")
+                section.add_css_class("lesson-card")
+                section.append(label(topic.title, "title-3"))
+                section.append(label(topic.goal))
+                section.append(label(topic.quick_reference, "learning-body"))
+                record = self.progress.lesson(self.language, topic.id)
+                self.practice_observations(section, topic.checks, record, refresh)
+                (shared if topic.id in combined_skills else article).append(section)
+        if plan and plan["kind"] == "practice":
+            article.append(label(plan["title"], "title-2"))
+            self.pace_activities(article, plan)
+        following = next((item for item in self.milestones.values() if item.prerequisite == stage.id), None)
+        if following:
+            article.append(button(f"Next milestone · {following.title}", lambda: self.open_milestone(following), "flat"))
+        article.append(button("Back to milestone list", self.open_milestones, "flat"))
+
+    def open_quiz(self, stage, form="concept"):
+        article = self.document("quiz", stage.title)
+        article.append(label("Concept quiz" if form == "concept" else "Follow-up quiz", "title-1"))
+        article.append(label(stage.title, "title-3"))
+        article.append(label("Use the results to choose what to revisit. Core skills also require demonstrated behavior."))
+        course = self.progress.course(self.language)
+        previous = quiz_results(course, stage, form)
+        controls = []
+        for item in questions(stage, form):
+            group = column(7)
             group.add_css_class("card")
             group.add_css_class("lesson-card")
-            group.append(label(question, "heading"))
+            group.append(label(item.prompt, "heading"))
+            choices = list(item.alternatives)
+            slot = hashlib.sha256(item.id.encode()).digest()[0] % (len(choices) + 1)
+            choices.insert(slot, item.answer)
             radios = []
-            for index, choice in enumerate(choices):
+            for choice in choices:
                 radio = Gtk.CheckButton(label=choice)
                 if radios:
                     radio.set_group(radios[0])
                 radios.append(radio)
-                radio.set_active(previous.get(lesson_id) == index)
                 group.append(radio)
-            feedback = label()
+            feedback = label("Previously correct" if previous.get(item.id) is True else
+                             "Previously marked for practice" if previous.get(item.id) is False else "")
             group.append(feedback)
-            controls.append((lesson_id, correct, explanation, radios, feedback))
+            controls.append((item, slot, radios, feedback))
             article.append(group)
 
-        recommendation = label()
-        plan = column(5)
-
-        def recap():
-            while (child := plan.get_first_child()) is not None:
-                plan.remove(child)
-            review = self.practice_recommendations()
-            recommendation.set_text("Suggested practice" if review else "")
-            for lesson in review:
-                plan.append(button(lesson.title, lambda item=lesson: self.open_lesson(item), "flat"))
-
         def grade():
+            selected = [next((i for i, radio in enumerate(radios) if radio.get_active()), None)
+                        for _, _, radios, _ in controls]
+            if None in selected:
+                summary.set_text("Answer every question to record the result.")
+                return
             answers = {}
-            for lesson_id, correct, explanation, radios, feedback in controls:
-                choice = next((i for i, radio in enumerate(radios) if radio.get_active()), None)
-                if choice is None:
-                    feedback.set_text("Choose an answer when you are ready.")
-                    continue
-                answers[lesson_id] = choice
-                feedback.set_text(("Correct. " if choice == correct else "Revisit this concept. ") + explanation)
-            course["quiz"] = answers
+            for (item, slot, _, feedback), choice in zip(controls, selected, strict=True):
+                correct = choice == slot
+                answers[item.id] = correct
+                feedback.set_text("Correct." if correct else f"Revisit this concept. {item.answer}")
+            course.setdefault("milestone_quizzes", {}).setdefault(stage.id, {})[form] = answers
             self.save()
-            recap()
+            summary.set_text(f"{sum(answers.values())}/{len(controls)} correct. Open your milestone to see what to practice.")
 
+        summary = label()
         article.append(button("Review answers", grade, "suggested-action"))
-        article.append(recommendation)
-        article.append(plan)
-        recap()
+        article.append(summary)
+        article.append(button("Return to milestone", lambda: self.open_milestone(stage), "flat"))
 
-    def practice_recommendations(self):
-        quiz = self.progress.course(self.language).get("quiz", {})
-        answer_key = {item[0]: item[3] for item in self.course["quiz"]}
-        recommendations = []
-        for lesson in self.lessons.values():
-            record = self.progress.lesson(self.language, lesson.id)
-            missed = lesson.id in quiz and quiz[lesson.id] != answer_key[lesson.id]
-            needs_review = record.get("latest_check") == "needs practice" and (
-                record.get("review") == "needs practice" or record.get("attempts", 0) >= 2
-            )
-            if missed or needs_review:
-                recommendations.append(lesson)
-        return recommendations
+    def open_pacing(self, stage):
+        article = self.document("quiz", "Pace and practice")
+        course = self.progress.course(self.language)
+        article.append(label(f"Pace and practice · {stage.title}", "title-1"))
+        article.append(label("Every core skill stays in the standard course. You can add short practice or use "
+                             "one larger project to demonstrate two related skills. Local code checks and quiz results "
+                             "guide these choices. Editor-project checks are observations you record."))
+        adjustment = course.setdefault("pacing", {}).setdefault(stage.id, {"active": None, "saved": {}})
+        current = adjustment["saved"].get(adjustment["active"])
+        if current:
+            article.append(label(f"Active adjustment · {current['title']}", "title-2"))
+            article.append(label(current["reason"]))
+            self.pace_activities(article, current)
+
+            def restore():
+                adjustment["active"] = None
+                self.save()
+                self.open_pacing(stage)
+
+            article.append(button("Restore standard pace", restore, "flat"))
+        practice, combined = pacing_options(course, stage, self.lessons)
+        prior = stage.prerequisite
+        while combined and prior:
+            prerequisite = self.milestones[prior]
+            if not milestone_ready(course, prerequisite, self.lessons):
+                combined = []
+            prior = prerequisite.prerequisite
+        options = [("practice", (key,)) for key in practice] + [("combine", pair) for pair in combined]
+        titles = {key: (self.lessons.get(key) or self.topics[key]).title for key in stage.skill_ids}
+        prompts = ["More practice · " + titles[key] for key in practice]
+        prompts.extend("Combine · " + " + ".join(titles[key] for key in pair) for pair in combined)
+        article.append(label("Combination requires both skills’ checks to pass, correct answers for each skill on "
+                             "two separately graded quizzes, at least 80% on both, and readiness on the prerequisites.",
+                             "dim-label"))
+        if not options:
+            article.append(label("Record a behavior check or take the quiz to see evidence-based practice options."))
+        else:
+            chooser = Gtk.DropDown(model=Gtk.StringList.new(prompts), halign=Gtk.Align.START)
+            chooser.set_tooltip_text("Choose a practice or combination to preview")
+            article.append(chooser)
+            result = column(8)
+            status = label()
+            cancel = self.cancel_control(status)
+
+            def make_plan():
+                kind, keys = options[chooser.get_selected()]
+                names = [titles[key] for key in keys]
+                if kind == "practice":
+                    key = keys[0]
+                    lesson = self.lessons.get(key)
+                    if lesson and lesson.cases:
+                        cue = lesson.example_description
+                        inputs = ", ".join(lesson.cases[-1].arguments)
+                        exercise = (f"Predict the result for inputs {inputs}. Run the lesson checks and compare your prediction."
+                                    if inputs else "Try a different message, predict the output, then run the lesson checks.")
+                    elif lesson:
+                        cue = lesson.example_description
+                        exercise = f"Run a small check in your Cargo project. Look for this result: {lesson.editor_checks[-1]}"
+                    else:
+                        topic = self.topics[key]
+                        cue = topic.quick_reference
+                        exercise = f"Run the boundary case in your Cargo project. Look for this result: {topic.checks[-1]}"
+                    reason = "A concept answer or an observed check points to this skill for practice."
+                    steps = [f"Trace one example and explain the result. {cue}", exercise]
+                    title = f"Practice {names[0]}"
+                else:
+                    reason = "Both skills met their behavior checks and their concept and follow-up quiz criteria."
+                    title = "Shared project practice"
+                    steps = [f"Use this project: {stage.endpoint} Explain where each skill appears in your implementation.",
+                             "Run the normal and edge cases for each skill in the shared project. Record them separately."]
+                return {"kind": kind, "skills": list(keys), "title": title, "reason": reason, "steps": steps,
+                        "done": [], "origin": "Authored outline"}
+
+            def clear(*_args):
+                while (child := result.get_first_child()) is not None:
+                    result.remove(child)
+                status.set_text("")
+
+            def preview(plan):
+                clear()
+                result.append(label("Preview and edit", "title-2"))
+                result.append(label(" · ".join(titles[key] for key in plan["skills"])))
+                result.append(label(plan["reason"]))
+                result.append(label(plan["origin"], "dim-label"))
+                fields = []
+                for name, value in zip(("Title", "First activity", "Second activity"),
+                                       (plan["title"], *plan["steps"]), strict=True):
+                    result.append(label(name, "heading"))
+                    entry = Gtk.Entry(text=value, max_length=400)
+                    entry.set_tooltip_text(name)
+                    result.append(entry)
+                    fields.append(entry)
+
+                def apply():
+                    title, *steps = [field.get_text().strip() for field in fields]
+                    if not title or not all(steps):
+                        status.set_text("Enter a title and both activity descriptions.")
+                        return
+                    key = uuid4().hex
+                    adjustment["saved"][key] = {**plan, "title": title, "steps": steps}
+                    adjustment["active"] = key
+                    self.save()
+                    self.open_pacing(stage)
+
+                result.append(button("Apply this pace adjustment", apply, "suggested-action"))
+
+            def ask():
+                clear()
+                plan = make_plan()
+                items = []
+                concept = quiz_results(course, stage)
+                follow_up = quiz_results(course, stage, "transfer") if stage.outline else {}
+                for key in plan["skills"]:
+                    item = self.lessons.get(key) or self.topics[key]
+                    skill = skill_progress(course, key, self.lessons)
+                    items.append({"id": key, "title": titles[key], "goal": item.question if key in self.lessons else item.goal,
+                                  "checks": f"{skill.passed}/{skill.required}", "hints": skill.hints, "retries": skill.retries,
+                                  "concept_quiz": [concept.get(q.id) for q in questions(stage) if q.topic == key],
+                                  "follow_up_quiz": follow_up.get(item.transfer.id) if key in self.topics else None})
+                data = {"kind": plan["kind"], "skills": items, "reason": plan["reason"], "project": stage.endpoint,
+                        "prerequisite": stage.prerequisite, "outline": plan["steps"]}
+
+                def receive(response):
+                    adapted, model_status = response
+                    preview({**plan, **adapted, "origin": "Local tutor proposal"})
+                    status.set_text(model_status)
+
+                self.ask_model(lambda: pace_task(data), receive, status, cancel)
+
+            def selection_changed(*_args):
+                self.cancel_tutor()
+                clear()
+
+            chooser.connect("notify::selected", selection_changed)
+            article.append(button("Preview suggested activities", lambda: preview(make_plan())))
+            tutor_button = button("Ask tutor to draft activities", ask)
+            tutor_button.set_sensitive(self.tutor_configured())
+            article.append(tutor_button)
+            article.append(cancel)
+            article.append(status)
+            article.append(result)
+
+        archived = [plan for key, plan in adjustment["saved"].items() if key != adjustment["active"]]
+        if archived:
+            history = Gtk.Expander(label="Previous adjustments and progress")
+            entries = column(8)
+            for old in reversed(archived):
+                entries.append(label(old["title"], "heading"))
+                entries.append(label(f"{len(old['done'])} of {len(old['steps'])} activities completed"))
+            history.set_child(entries)
+            article.append(history)
+        article.append(button("Back to milestone", lambda: self.open_milestone(stage), "flat"))
+
+    def pace_activities(self, article, plan):
+        for index, step in enumerate(plan["steps"]):
+            article.append(label(step, "learning-body"))
+            done = Gtk.CheckButton(label="Activity complete", active=index in plan["done"])
+
+            def mark(control, item=index):
+                if control.get_active():
+                    plan["done"].append(item)
+                else:
+                    plan["done"].remove(item)
+                self.save()
+
+            done.connect("toggled", mark)
+            article.append(done)
+        article.append(label("Keep each core skill’s evidence in the milestone. Activity completion adds to your "
+                             "practice history.", "dim-label"))
 
     def open_path(self):
-        article = self.document("next", "Path and editor setup")
-        article.append(label("From practice to projects", "title-1"))
-        article.append(label("Finish the calculator, then use a local editor to create and run a real Cargo project. "
-                             "The setup guide walks through installing the tools and reading your first diagnostics."))
-        article.append(button("Read the Ubuntu and editor setup guide", lambda: self.open_reference("cargo"), "suggested-action"))
-        article.append(button("Review a file from your editor", self.open_editor_review))
+        article = self.document("next", "Course roadmap")
+        article.append(label("From first programs to useful apps", "title-1"))
+        article.append(label("Ten complete offline lessons introduce Rust. Forty-two shorter core outlines guide you "
+                             "from additional fundamentals to command-line, backend, and desktop projects."))
+        article.append(button("Read the Ubuntu and editor setup guide", lambda: self.open_reference("cargo"), "flat"))
+        article.append(button("Review a file from your editor", self.open_editor_review, "flat"))
+        for stage in self.milestones.values():
+            section = column(5)
+            section.add_css_class("card")
+            section.add_css_class("lesson-card")
+            section.append(button(stage.title, lambda item=stage: self.open_milestone(item), "flat"))
+            section.append(label(stage.endpoint))
+            titles = [(self.lessons.get(key) or self.topics[key]).title for key in stage.skill_ids]
+            section.append(label(" · ".join(titles), "dim-label"))
+            article.append(section)
+        article.append(label("Optional project path", "title-3"))
         projects = self.project_progress()
         active = projects["saved"].get(projects.get("active"))
         if active:
-            article.append(label("Your next lessons", "title-3"))
             article.append(label(active["idea"]))
             self.add_project_lessons(article, projects["active"], active)
-        else:
-            article.append(label("Standard course direction", "title-3"))
-            article.append(label("The next course projects will use a command-line tool to teach file input and error handling, "
-                                 "a desktop project to teach events and state, and a local backend to teach requests and responses."))
         article.append(button("Plan my project", self.open_project_paths))
-        recommendations = self.practice_recommendations()
-        if recommendations:
-            article.append(label("Suggested practice", "title-3"))
-            for lesson in recommendations:
-                article.append(button(lesson.title, lambda item=lesson: self.open_lesson(item), "flat"))
 
     def project_progress(self):
         course = self.progress.course(self.language)
         return course.setdefault("project_paths", {"active": None, "saved": {}})
 
+    def foundation_complete(self, key):
+        course = self.progress.course(self.language)
+        return (bool(course.get("lessons", {}).get(key, {}).get("passed"))
+                or skill_progress(course, key, self.lessons).demonstrated)
+
+    def foundations_complete(self):
+        return all(self.foundation_complete(key) for key in self.lessons)
+
     def add_project_lessons(self, container, plan_id, plan):
+        if not plan["completed"] and not self.foundations_complete():
+            container.append(label("Your saved project pages open after all ten foundation exercises are complete.",
+                                   "dim-label"))
+            return
         for index, page in enumerate(plan["pages"]):
             complete = " · Complete" if page["id"] in plan["completed"] else ""
             container.append(button(page["title"] + complete,
@@ -751,7 +1179,7 @@ class TutorWindow(Adw.ApplicationWindow):
     def open_project_paths(self):
         article = self.document("projects", "Project paths")
         article.append(label("Plan a project you want to build", "title-1"))
-        article.append(label("Start with the calculator lessons, then use your idea to practice in VS Code or VSCodium. "
+        article.append(label("Plan now and work through the optional pages after the ten foundation exercises. "
                              "Preview a three-lesson template, or ask the local tutor to adapt it to your idea."))
         projects = self.project_progress()
         idea = Gtk.Entry(placeholder_text="Example: A weekly grocery planner", max_length=180)
@@ -856,6 +1284,9 @@ class TutorWindow(Adw.ApplicationWindow):
 
     def open_project_lesson(self, plan_id, index):
         plan = self.project_progress()["saved"][plan_id]
+        if not plan["completed"] and not self.foundations_complete():
+            self.open_project_paths()
+            return
         page = plan["pages"][index]
         article = self.document("projects", page["title"])
         article.append(label(plan["idea"], "dim-label"))
@@ -911,7 +1342,7 @@ class TutorWindow(Adw.ApplicationWindow):
         review_status = label()
         answer = column()
         cancel = self.cancel_control(review_status)
-        entries = tuple(self.lessons.values())
+        entries = tuple(lesson for lesson in self.lessons.values() if not lesson.editor_checks)
         exercise_choice = Gtk.DropDown(model=Gtk.StringList.new(["Select a lesson"] + [entry.title for entry in entries]))
         exercise_choice.set_tooltip_text("Choose which exercise requirements the selected file should meet")
 

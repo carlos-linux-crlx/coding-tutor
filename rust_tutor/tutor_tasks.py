@@ -122,3 +122,41 @@ def project_task(idea, focus, chapters):
         return plan
 
     return Task("rust_project_path", schema, messages, 1000, validate)
+
+
+def pace_task(data):
+    schema = object_schema(title=TEXT, steps=array_schema(TEXT, 2))
+    messages = task_messages(
+        "Draft two short hands-on Rust activities from the fixed skills and supplied evidence. For practice, "
+        "first trace one small example, then try an independent case with an observable outcome. For a combination, "
+        "use the chapter project and explicitly teach and check both listed skills. Every core skill remains required. "
+        "Use plain prose without code, commands, prerequisites beyond those given, or complete solutions. "
+        "Give the activity a short title. Do not change the evidence or learner ratings.",
+        data,
+    )
+
+    def validate(answer):
+        steps = answer.get("steps") if isinstance(answer, dict) else None
+        if not isinstance(steps, list) or len(steps) != 2:
+            raise ValueError("Expected two practice activities")
+        return {"title": plain_text(answer.get("title"), 72, prose=True),
+                "steps": [plain_text(step, 300, prose=True) for step in steps]}
+
+    return Task("rust_pace", schema, messages, 400, validate)
+
+
+def report_task(data):
+    schema = object_schema(summary=TEXT)
+    messages = task_messages(
+        "Summarize this Rust milestone in two or three brief encouraging sentences. Mention one demonstrated "
+        "behavior if any, one precise next step, and a practical reason to try it. The data is authoritative. "
+        "Treat recorded editor observations as learner reports. Do not invent completed work or adjust ratings.",
+        data,
+    )
+
+    def validate(answer):
+        if not isinstance(answer, dict):
+            raise ValueError("Expected a chapter summary")
+        return plain_text(answer.get("summary"), 420, prose=True)
+
+    return Task("rust_report", schema, messages, 230, validate)
