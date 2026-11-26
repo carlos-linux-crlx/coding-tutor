@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+from http.client import HTTPException
 import os
 from pathlib import Path
 import platform
@@ -9,6 +10,7 @@ import shutil
 import tarfile
 from tempfile import TemporaryDirectory
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import build_opener, HTTPRedirectHandler, Request as DownloadRequest
 
@@ -68,52 +70,107 @@ def need_resources(preset, assets):
     return ""
 
 
+PUBLISHER_HOSTS = {
+    "github.com": {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"},
+    "huggingface.co": {
+        "huggingface.co",
+        "us.aws.cdn.hf.co",
+        "us.gcp.cdn.hf.co",
+        "cdn-lfs-us-1.hf.co",
+        "cdn-lfs-eu-1.hf.co",
+        "cdn-lfs.huggingface.co",
+        "cdn-lfs-us-1.huggingface.co",
+        "cas-bridge.xethub.hf.co",
+        "transfer.xethub.hf.co",
+        "transfer.xethub-eu.hf.co",
+    },
+}
+
+
+def https_download_host(url):
+    try:
+        target = urlsplit(url)
+        if (target.scheme == "https" and target.port in (None, 443)
+                and target.username is None and target.password is None):
+            return target.hostname
+    except ValueError:
+        pass
+    return None
+
+
 class PublisherRedirect(HTTPRedirectHandler):
     def __init__(self, host):
-        self.host = host
+        self.allowed_hosts = PUBLISHER_HOSTS[host]
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        try:
+            return super().http_error_302(req, fp, code, msg, headers)
+        except ValueError:
+            fp.close()
+            raise TutorError("The publisher sent an invalid HTTPS download redirect.") from None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        destination = urlsplit(newurl)
-        permitted = ({"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
-                     if self.host == "github.com"
-                     else {"huggingface.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co",
-                           "cas-bridge.xethub.hf.co", "transfer.xethub.hf.co"})
-        if (destination.scheme != "https" or destination.hostname not in permitted
-                or destination.username or destination.password):
-            raise TutorError("The publisher redirected to an unexpected download host.")
+        host = https_download_host(newurl)
+        if host is None:
+            fp.close()
+            raise TutorError("The publisher sent an invalid HTTPS download redirect.")
+        if host not in self.allowed_hosts:
+            fp.close()
+            raise TutorError("The publisher redirected the download outside its approved CDN hosts.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def download(asset, target, request, progress):
-    opener = build_opener(PublisherRedirect(urlsplit(asset.url).hostname))
+    request.check()
+    publisher = https_download_host(asset.url)
+    if publisher not in PUBLISHER_HOSTS:
+        raise TutorError(f"{asset.name} does not have an approved HTTPS download source.")
+    opener = build_opener(PublisherRedirect(publisher))
     web_request = DownloadRequest(asset.url, headers={"User-Agent": "RustTutor-model-manager"})
+    try:
+        response = opener.open(web_request, timeout=12)
+    except HTTPError as error:
+        error.close()
+        request.check()
+        raise TutorError(f"The publisher could not serve {asset.name} (HTTP {error.code}).") from None
+    except (OSError, HTTPException):
+        request.check()
+        raise TutorError(f"Could not connect to the publisher for {asset.name}. Check your network and retry.") from None
+
     digest = hashlib.sha256()
     received = 0
     last_update = 0.0
     try:
-        request.check()
-        with opener.open(web_request, timeout=12) as response, target.open("xb") as output:
+        with response:
+            request.check()
             if response.status != 200:
-                raise TutorError(f"The publisher returned HTTP {response.status}.")
-            while True:
-                request.check()
-                chunk = response.read1(1024 * 1024)
-                if not chunk:
-                    break
-                received += len(chunk)
-                if received > asset.size:
-                    raise TutorError(f"{asset.name} exceeded its pinned download size.")
-                output.write(chunk)
-                digest.update(chunk)
-                now = time.monotonic()
-                if now - last_update >= 0.2:
-                    progress(received)
-                    last_update = now
-            output.flush()
-            os.fsync(output.fileno())
+                raise TutorError(f"The publisher did not return a full download for {asset.name} (HTTP {response.status}).")
+            with target.open("xb") as output:
+                while True:
+                    request.check()
+                    try:
+                        chunk = response.read1(1024 * 1024)
+                    except (OSError, HTTPException):
+                        request.check()
+                        raise TutorError(f"The download of {asset.name} was interrupted. Check your network and retry.") from None
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > asset.size:
+                        raise TutorError(f"{asset.name} exceeded its pinned download size.")
+                    output.write(chunk)
+                    digest.update(chunk)
+                    now = time.monotonic()
+                    if now - last_update >= 0.2:
+                        progress(received)
+                        last_update = now
+                output.flush()
+                os.fsync(output.fileno())
     except OSError:
         request.check()
-        raise TutorError(f"Could not download {asset.name}. Check the connection and free disk space.") from None
+        raise TutorError(f"Could not save {asset.name}. Check free disk space and storage permissions.") from None
     request.check()
     if received != asset.size or digest.hexdigest() != asset.sha256:
         raise TutorError(f"{asset.name} did not match its pinned size and SHA-256. Retry from Model setup.")

@@ -69,12 +69,17 @@ STAGES = (
 )
 
 
-def propose_path(idea, focus):
+def project_idea(idea, focus):
     idea = idea.strip()
     if not idea or len(idea) > 180:
         raise ValueError("Describe your idea in 1–180 characters.")
     if focus not in FOCUSES:
         raise ValueError("Choose what the first version should do.")
+    return idea
+
+
+def propose_path(idea, focus):
+    idea = project_idea(idea, focus)
     pages = []
     for index, (stage, detail) in enumerate(zip(STAGES, MATERIAL[focus], strict=True), start=1):
         goal, concepts, reference, milestone = stage
@@ -91,3 +96,48 @@ def propose_path(idea, focus):
             "reference": "data" if index == 1 and focus in {"organize", "text"} else reference,
         })
     return {"schema": 1, "idea": idea, "focus": focus, "pages": pages, "completed": []}
+
+
+def propose_roadmap_path(idea, focus, stage, topics, extension):
+    idea = project_idea(idea, focus)
+    pages = [
+        {"id": f"project-{topic.id}", "skill": topic.id, "skill_title": topic.title,
+         "goal": topic.goal, "reference": "resources", "checks": list(topic.checks),
+         "quick_reference": topic.quick_reference}
+        for topic in topics
+    ]
+    return {"schema": 2, "idea": idea, "focus": focus, "milestone": stage.id,
+            "prerequisite": stage.prerequisite, "extension": extension, "pages": pages, "completed": []}
+
+
+def remedial_pages(key, item, *, authored):
+    if authored:
+        explanation = item.explanation
+        example = f"{item.example_description} {item.walkthrough[0][1]}"
+        code = item.example
+        hint = item.hints[0]
+        if item.cases:
+            case = item.cases[-1]
+            arguments = ", ".join(case.arguments)
+            exercise = (f"Predict what your exercise should do for {arguments}, then run the lesson checks."
+                        if arguments else "Choose a new greeting, predict the line it will print, then run the lesson checks.")
+            criterion = ("The selected case agrees with your prediction and the lesson checks."
+                         if arguments else "Your program prints one nonempty line in your own words.")
+        else:
+            exercise = "Try the last case in your Cargo project. Record what you observe before changing your code."
+            criterion = item.editor_checks[-1]
+    else:
+        explanation, code = item.goal, ""
+        example = f"Trace the ordinary case before editing. {item.checks[0]}"
+        hint = item.quick_reference
+        exercise = "Try the boundary case in your Cargo project. Predict the outcome before running it."
+        criterion = item.checks[-1]
+    return [
+        {"id": f"{key}-trace", "title": f"Trace an example · {item.title}",
+         "explanation": explanation, "example": example, "example_code": code,
+         "exercise": "Trace a value from its input to the result. Predict what would change with a different input.",
+         "hint": hint, "checks": ["State your prediction and explain how the example produces its result."]},
+        {"id": f"{key}-try", "title": f"Try a small variation · {item.title}",
+         "explanation": explanation, "example": example, "example_code": "",
+         "exercise": exercise, "hint": hint, "checks": [criterion]},
+    ]
