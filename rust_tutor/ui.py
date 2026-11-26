@@ -33,6 +33,8 @@ from .tutor_tasks import PAGE_FIELDS, guidance_task, pace_task, project_task, re
 
 MANUAL_FIELDS = {"title": "Title", "explanation": "Concept", "example": "Worked example",
                  "exercise": "Try it yourself", "hint": "Hint"}
+CORE_PATH = "Core app-building path"
+ADVANCED_PATH = "Advanced Rust continuation"
 
 
 def column(spacing=12):
@@ -99,7 +101,7 @@ class TutorWindow(Adw.ApplicationWindow):
         self.course = COURSES[self.language]
         self.lessons = {lesson.id: lesson for lesson in self.course["lessons"]}
         self.chapters = {chapter.id: chapter for chapter in self.course["chapters"]}
-        self.milestones = {stage.id: stage for stage in self.course["milestones"]}
+        self.milestones = {stage.id: stage for stage in (*self.course["milestones"], *self.course["advanced_milestones"])}
         self.topics = {topic.id: topic for stage in self.milestones.values() for topic in stage.outline}
         self.progress = Progress()
         self.narrator = Narrator()
@@ -801,16 +803,21 @@ class TutorWindow(Adw.ApplicationWindow):
         article.append(label("Ready to move on means all required behavior checks passed and a complete concept quiz "
                              "with at least 80% correct. Hints and retries describe support used."))
         course = self.progress.course(self.language)
-        for stage in self.milestones.values():
-            ready = milestone_ready(course, stage, self.lessons)
-            article.append(button(f"{stage.title} · {'Ready to move on' if ready else 'View progress'}",
-                                  lambda item=stage: self.open_milestone(item), "flat"))
+        for title, path in ((CORE_PATH, "milestones"), (ADVANCED_PATH, "advanced_milestones")):
+            article.append(label(title, "title-2"))
+            for stage in self.course[path]:
+                ready = milestone_ready(course, stage, self.lessons)
+                article.append(button(f"{stage.title} · {'Ready to move on' if ready else 'View progress'}",
+                                      lambda item=stage: self.open_milestone(item), "flat"))
 
     def open_milestone(self, stage):
         article = self.document("quiz", stage.title)
         course = self.progress.course(self.language)
         plan = self.active_pace(stage)
+        advanced = stage in self.course["advanced_milestones"]
         article.append(label(stage.title, "title-1"))
+        if advanced:
+            article.append(label(ADVANCED_PATH, "dim-label"))
         if stage.prerequisite:
             prior = self.milestones[stage.prerequisite]
             article.append(button(f"Prerequisite · {prior.title}", lambda: self.open_milestone(prior), "flat"))
@@ -909,7 +916,7 @@ class TutorWindow(Adw.ApplicationWindow):
                 article.append(button(lesson.title, lambda item=lesson: self.open_lesson(item), "flat"))
                 self.insert_practice(article, stage, key, lambda: self.open_milestone(stage))
         else:
-            article.append(label("Core lesson outlines", "title-2"))
+            article.append(label("Advanced lesson outlines" if advanced else "Core lesson outlines", "title-2"))
             article.append(label("Study each idea and try its two checks in a local Cargo project. "
                                  "You can use the chapter project to demonstrate both."))
             combined_skills = plan["skills"] if plan and plan["kind"] == "combine" else ()
@@ -934,9 +941,14 @@ class TutorWindow(Adw.ApplicationWindow):
                 (shared if topic.id in combined_skills else article).append(section)
                 self.insert_practice(article, stage, topic.id, lambda: self.open_milestone(stage))
                 self.insert_project_page(article, stage, topic.id)
+        if stage.sources:
+            article.append(label("References", "title-3"))
+            for title, url in stage.sources:
+                article.append(Gtk.LinkButton(uri=url, label=title, halign=Gtk.Align.START))
         following = next((item for item in self.milestones.values() if item.prerequisite == stage.id), None)
         if following:
-            article.append(button(f"Next milestone · {following.title}", lambda: self.open_milestone(following), "flat"))
+            caption = "Explore advanced Rust" if not advanced and following in self.course["advanced_milestones"] else "Next milestone"
+            article.append(button(f"{caption} · {following.title}", lambda: self.open_milestone(following), "flat"))
         article.append(button("Back to milestone list", self.open_milestones, "flat"))
 
     def open_quiz(self, stage, form="concept"):
@@ -1261,12 +1273,31 @@ class TutorWindow(Adw.ApplicationWindow):
 
     def open_path(self):
         article = self.document("next", "Course roadmap")
-        article.append(label("From first programs to useful apps", "title-1"))
-        article.append(label("Ten complete offline lessons introduce Rust. Forty-two shorter core outlines guide you "
-                             "from additional fundamentals to command-line, backend, and desktop projects."))
+        article.append(label("Rust course roadmap", "title-1"))
         article.append(button("Read the Ubuntu and editor setup guide", lambda: self.open_reference("cargo"), "flat"))
         article.append(button("Review a file from your editor", self.open_editor_review, "flat"))
-        for stage in self.milestones.values():
+        article.append(label(CORE_PATH, "title-2"))
+        article.append(label("Ten offline foundations and 42 shorter topics prepare you for command-line, backend, "
+                             "and desktop projects. This path ends with the application capstone."))
+        self.roadmap_cards(article, self.course["milestones"])
+        article.append(label("Optional app project path", "title-3"))
+        projects = self.project_progress()
+        active = projects["saved"].get(projects.get("active"))
+        if active:
+            article.append(label(active["idea"]))
+            self.add_project_lessons(article, projects["active"], active)
+        article.append(button("Plan my project", self.open_project_paths))
+        article.append(label(ADVANCED_PATH, "title-2"))
+        article.append(label("Continue after the capstone with six milestones in ownership, concurrency, macros, "
+                             "async, and unsafe Rust. Use the prerequisites, checks, and references to guide further study."))
+        self.roadmap_cards(article, self.course["advanced_milestones"])
+        article.append(label("Optional specialization · Foreign function interface (FFI)", "title-3"))
+        article.append(label("Explore FFI if your project needs to call code built in another language."))
+        for title, url in self.course["optional_references"]:
+            article.append(Gtk.LinkButton(uri=url, label=title, halign=Gtk.Align.START))
+
+    def roadmap_cards(self, article, milestones):
+        for stage in milestones:
             section = column(5)
             section.add_css_class("card")
             section.add_css_class("lesson-card")
@@ -1275,13 +1306,6 @@ class TutorWindow(Adw.ApplicationWindow):
             titles = [(self.lessons.get(key) or self.topics[key]).title for key in stage.skill_ids]
             section.append(label(" · ".join(titles), "dim-label"))
             article.append(section)
-        article.append(label("Optional project path", "title-3"))
-        projects = self.project_progress()
-        active = projects["saved"].get(projects.get("active"))
-        if active:
-            article.append(label(active["idea"]))
-            self.add_project_lessons(article, projects["active"], active)
-        article.append(button("Plan my project", self.open_project_paths))
 
     def project_progress(self):
         course = self.progress.course(self.language)
@@ -1416,7 +1440,7 @@ class TutorWindow(Adw.ApplicationWindow):
         def adapt():
             clear_proposal()
             course = self.progress.course(self.language)
-            stage, topics, extension = upcoming_project_topics(course, self.milestones.values(), self.lessons)
+            stage, topics, extension = upcoming_project_topics(course, self.course["milestones"], self.lessons)
             try:
                 draft = propose_roadmap_path(idea.get_text(), focus_key(), stage, topics, extension)
             except ValueError as error:

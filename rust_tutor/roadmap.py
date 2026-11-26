@@ -33,6 +33,7 @@ class Milestone:
     questions: tuple[Question, ...] = ()
     outline: tuple[Topic, ...] = ()
     sheet: tuple[tuple[str, str], ...] = ()
+    sources: tuple[tuple[str, str], ...] = ()
 
     @property
     def cheat_sheet(self):

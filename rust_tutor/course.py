@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .advanced import ADVANCED_ROADMAP, OPTIONAL_FFI
 from .foundations import early_lessons, editor_lessons, foundation_milestones
 from .roadmap import ROADMAP, Milestone, question
 
@@ -288,4 +289,5 @@ CHAPTERS = (
 
 LESSONS = (INITIAL_LESSONS[0], *early_lessons(Lesson, Case), *INITIAL_LESSONS[1:], *editor_lessons(Lesson))
 COURSES = {"rust": {"title": "Rust", "lessons": LESSONS, "chapters": CHAPTERS,
-                   "milestones": (*foundation_milestones(Milestone, question), *ROADMAP)}}
+                   "milestones": (*foundation_milestones(Milestone, question), *ROADMAP),
+                   "advanced_milestones": ADVANCED_ROADMAP, "optional_references": (OPTIONAL_FFI,)}}

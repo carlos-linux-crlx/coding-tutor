@@ -7,6 +7,12 @@ def sheet_terms(entries):
         yield f"<dt>{escape(term)}</dt><dd>{escape(idea)}</dd>"
 
 
+def source_items(sources):
+    for title, url in sources:
+        safe_url = escape(url, quote=True)
+        yield f'<li>{escape(title)}. <a href="{safe_url}">{safe_url}</a></li>'
+
+
 def printable_sheet(title, entries):
     return "\n".join((
         '<!doctype html><html lang="en"><meta charset="utf-8">',
@@ -51,9 +57,7 @@ def printable_reference(chapters, milestones=()):
         for title, text in chapter.sections:
             content.append(f'<h3>{escape(title)}</h3><p>{escape(text)}</p>')
         content.append(f'<h3>Example</h3><pre>{escape(chapter.example)}</pre><h3>Sources</h3><ul>')
-        for title, url in chapter.sources:
-            safe_url = escape(url, quote=True)
-            content.append(f'<li>{escape(title)}. <a href="{safe_url}">{safe_url}</a></li>')
+        content.extend(source_items(chapter.sources))
         content.append('</ul><h3>Cheat sheet</h3><dl>')
         content.extend(sheet_terms(chapter.cheat_sheet))
         content.append('</dl></section>')
@@ -63,6 +67,10 @@ def printable_reference(chapters, milestones=()):
             content.append(f'<h3>{escape(stage.title)}</h3><dl>')
             content.extend(sheet_terms(stage.cheat_sheet))
             content.append('</dl>')
+            if stage.sources:
+                content.append('<ul>')
+                content.extend(source_items(stage.sources))
+                content.append('</ul>')
         content.append('</section>')
     content.append('</main></html>')
     return "\n".join(content)

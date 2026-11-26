@@ -1,6 +1,19 @@
 # Rust Tutor
 
-Rust Tutor is a local GTK 4 and libadwaita learning app for Ubuntu. Ten authored Rust lessons introduce each idea through an explanation, a worked example, and an independent exercise. Forty-two shorter core outlines cover further Rust fundamentals and lead to command-line, local backend, and desktop projects. The course, companion reference, and progress reports work offline.
+Rust Tutor is a local GTK 4 and libadwaita learning app for Ubuntu. The **Core app-building path** uses ten authored lessons and 42 shorter outlines to lead from a first Rust program to command-line, backend, and desktop projects. The **Advanced Rust continuation** adds a focused introduction to deeper language topics after the application capstone. Course content, the companion reference, and progress reports work offline.
+
+## Course paths
+
+The core path ends with an application capstone. The advanced continuation adds 18 topics in six milestones, each with prerequisites, observable editor checks, a concept quiz, a follow-up quiz, and a printable cheat sheet.
+
+1. Smart pointers with `Box`, `Rc`, and `Arc`. [The Rust Book](https://doc.rust-lang.org/book/ch15-00-smart-pointers.html)
+2. Interior mutability with `Cell`, `RefCell`, and `Mutex`. [Standard library](https://doc.rust-lang.org/std/cell/index.html)
+3. Threads, `Send` and `Sync`, and safe shared state. [The Rust Book](https://doc.rust-lang.org/book/ch16-00-concurrency.html)
+4. `macro_rules!`, derive, and other procedural macro forms. [The Rust Reference](https://doc.rust-lang.org/reference/procedural-macros.html)
+5. Futures, task scheduling, and cancellation. [The Rust Book](https://doc.rust-lang.org/book/ch17-00-async-await.html), [Tokio task documentation](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html)
+6. Unsafe contracts, invariants, and choosing a safe abstraction. [The Rust Book](https://doc.rust-lang.org/book/ch20-01-unsafe-rust.html), [The Rust Reference](https://doc.rust-lang.org/reference/behavior-considered-undefined.html)
+
+The advanced checks are run in your editor and recorded in Rust Tutor. The unsafe introduction uses code reading, a compile diagnostic, and a safe slice exercise. FFI is an optional specialization for projects that need to call code from another language. [Rustonomicon · FFI](https://doc.rust-lang.org/nomicon/ffi.html)
 
 ## Start on Ubuntu
 
@@ -54,7 +67,7 @@ Open **Milestones and progress** for a chapter report with a behavior-check bar 
 
 ## Personalize the upcoming lessons
 
-Open **Project paths**, enter an idea, and choose the first job your app should do. **Preview authored template** shows three offline lessons. **Build a project path with the tutor** uses the next unfinished roadmap chapter and saved check and quiz evidence. The tutor drafts up to three lesson pages with a concept explanation, a worked example, an independent exercise, and a hint. The skills, prerequisites, and behavior criteria come from the standard roadmap.
+Open **Project paths**, enter an idea, and choose the first job your app should do. **Preview authored template** shows three offline lessons. **Build a project path with the tutor** uses the next unfinished chapter in the core app-building path and saved check and quiz evidence. The tutor drafts up to three lesson pages with a concept explanation, a worked example, an independent exercise, and a hint. The skills, prerequisites, and behavior criteria come from the core roadmap.
 
 Edit the proposal in the preview, then select **Use this path**. The approved pages appear next to their core topics once prerequisites are ready. Mark project pages complete separately from core checks. You can switch paths or return to the standard course while keeping your progress.
 
