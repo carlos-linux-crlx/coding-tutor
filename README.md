@@ -85,11 +85,13 @@ APPIMAGE_EXTRACT_AND_RUN=1 \
   ./packaging/build-appimage.sh
 ```
 
-Run the resulting `build/RustTutor-x86_64.AppImage` directly on a desktop with FUSE available. Use extract-and-run mode on systems without FUSE. [AppImage FUSE guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
+The build names the AppImage using Rust Tutor’s version. Run `build/RustTutor-v1.0.0-x86_64.AppImage` directly on a desktop with FUSE available. Use extract-and-run mode on systems without FUSE. [AppImage FUSE guide](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./build/RustTutor-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./build/RustTutor-v1.0.0-x86_64.AppImage
 ```
+
+Pass `--version` to the AppImage to print the application version without opening a window.
 
 The x86-64 build was verified with appimagetool `11d54c9` and the Type 2 runtime `fedfad5`. SquashFS inspection found the packaged launcher and desktop entry, and an extract-and-run launch opened the GTK window. The output and downloaded tools stay in Git-ignored `build/`.
 
