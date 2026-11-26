@@ -73,6 +73,23 @@ Open **Project paths**, enter an idea, and choose the first job your app should 
 
 Edit the proposal in the preview, then select **Use this path**. The approved pages appear next to their core topics once prerequisites are ready. Mark project pages complete separately from core checks. You can switch paths or return to the standard course while keeping your progress.
 
+## License and use notice
+
+The original Rust Tutor application code, authored lesson text, and project
+documentation are available under the MIT License in [LICENSE](LICENSE).
+Third-party software and assets have separate terms; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The course links to the Rust
+project's documentation and does not include its book text or illustrations.
+
+Tutor explanations and model-generated reviews or lesson drafts can be
+incomplete or wrong. Verify them against primary references, inspect all code,
+and run your own checks before relying on it. Rust Tutor is an educational tool,
+not legal, security, or professional advice. The application and its output are
+provided without warranties as described in LICENSE and to the extent allowed
+by applicable law. These notices do not guarantee that every code sample or
+model output is free of third-party rights; check source and model terms before
+redistributing material or generated output.
+
 ## Build and run the AppImage
 
 The AppImage uses the host Ubuntu Python, GTK, and libadwaita packages listed above. For an x86-64 build, save the official `appimagetool-x86_64.AppImage` and `runtime-x86_64` release assets in `build/tooling/`. Compare their SHA-256 values with the release asset digests before running the tool. [appimagetool releases](https://github.com/AppImage/appimagetool/releases) · [Type 2 runtime releases](https://github.com/AppImage/type2-runtime/releases)
